@@ -1,6 +1,7 @@
 const { Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 // Create Discord client with necessary intents
@@ -15,6 +16,12 @@ const client = new Client({
 
 // Initialize SQLite database with persistent storage path
 const dbPath = process.env.DATABASE_PATH || '/data/vouch_points.db';
+// Ensure directory exists (Railway persistent volume: /data)
+try {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+} catch (e) {
+    console.error('Failed to ensure database directory exists:', e);
+}
 const db = new sqlite3.Database(dbPath);
 
 // Create table for storing vouch points
