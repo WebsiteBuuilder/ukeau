@@ -4,16 +4,23 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 
 ## Features
 
-- 🖼️ **Automatic Picture Detection**: Awards vouch points when users post images in channels containing "vouch"
-- 📊 **Point Tracking**: SQLite database to store and track user vouch points
+- 🖼️ **Automatic Vouch Detection**: Requires an image and a mention of a member with the Provider role in a `vouch` channel
+- 📊 **Point Tracking**: SQLite database stored at `/data/vouch_points.db` (persistent on Railway)
 - 🏆 **Leaderboard**: View top 10 users with most vouch points
 - 📈 **Individual Stats**: Check your own or others' vouch points
-- 🎉 **Celebration Messages**: Fun embed messages when points are awarded
+- 🚀 **Multiplier Mode**: Global multiplier (1x default) for boosted vouch events
+- 🛡️ **Admin Tools**: Add/remove points, set/reset multiplier
+- 🎉 **Celebrations**: DM and channel reply when points are awarded
 
 ## Commands
 
-- `/vouchpoints [user]` - Check vouch points for yourself or another user
-- `/vouchleaderboard` - View the top 10 users with most vouch points
+- `/leaderboard` - Show top users with the most vouch points
+- `/vouchpoints [user]` - See your own or another user's vouch points
+- `/addpoints @user X` - Admin: add X points
+- `/removepoints @user X` - Admin: remove X points
+- `/setmultiplier X` - Admin: set global multiplier (>=1)
+- `/multiplierstatus` - Show current multiplier
+- `/resetmultiplier` - Admin: reset multiplier to 1x
 
 ## Setup
 
@@ -63,6 +70,7 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 5. Add environment variables:
    - `DISCORD_TOKEN`: Your Discord bot token
    - `DATABASE_PATH`: `/data/vouch_points.db` (for persistent storage)
+   - `PROVIDER_ROLE_ID` or `PROVIDER_ROLE_NAME` (one is required for provider check)
 6. Deploy!
 
 ## How It Works
