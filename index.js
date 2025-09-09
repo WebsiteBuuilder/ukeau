@@ -47,6 +47,15 @@ db.serialize(() => {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        delta INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        meta TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    db.run('CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)');
 });
 
 // Ensure username column exists on vouch_points (for persistent display names)
@@ -164,6 +173,150 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
     }, delay);
 }
 
+// Casino helpers
+const activeBlackjack = new Map(); // userId -> state
+const activeCooldowns = new Map(); // key -> timestamp
+const BLACKJACK_COOLDOWN_MS = 10 * 1000;
+const ROULETTE_COOLDOWN_MS = 10 * 1000;
+const SLOTS_COOLDOWN_MS = 5 * 1000;
+
+function nowMs() { return Date.now(); }
+
+function onCooldown(key, durationMs) {
+    const prev = activeCooldowns.get(key) || 0;
+    const remaining = prev + durationMs - nowMs();
+    return remaining > 0 ? remaining : 0;
+}
+
+function setCooldown(key) {
+    activeCooldowns.set(key, nowMs());
+}
+
+function ensureCasinoChannel(interaction) {
+    const allowedId = process.env.CASINO_CHANNEL_ID;
+    const nameOk = interaction.channel?.name?.toLowerCase().includes('casino');
+    if (allowedId) return interaction.channelId === allowedId;
+    return Boolean(nameOk);
+}
+
+function getUserBalance(userId) {
+    return new Promise((resolve, reject) => {
+        db.get('SELECT points FROM vouch_points WHERE user_id = ?', [userId], (err, row) => {
+            if (err) { reject(err); return; }
+            resolve(row ? row.points : 0);
+        });
+    });
+}
+
+function changeUserBalance(userId, username, delta, reason, meta) {
+    return new Promise((resolve, reject) => {
+        db.serialize(() => {
+            db.run('BEGIN TRANSACTION');
+            db.get('SELECT points FROM vouch_points WHERE user_id = ?', [userId], (err, row) => {
+                if (err) { db.run('ROLLBACK'); reject(err); return; }
+                const current = row ? row.points : 0;
+                let next = current + delta;
+                if (next < 0) next = 0;
+                const upsertCb = (e2) => {
+                    if (e2) { db.run('ROLLBACK'); reject(e2); return; }
+                    db.run('INSERT INTO ledger (user_id, delta, reason, meta) VALUES (?, ?, ?, ?)', [userId, delta, reason, meta ? JSON.stringify(meta) : null], (e3) => {
+                        if (e3) { db.run('ROLLBACK'); reject(e3); return; }
+                        db.run('COMMIT', (e4) => {
+                            if (e4) { reject(e4); return; }
+                            resolve(next);
+                        });
+                    });
+                };
+                if (row) {
+                    db.run('UPDATE vouch_points SET points = ?, username = ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?', [next, username, userId], upsertCb);
+                } else {
+                    db.run('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)', [userId, next, username], upsertCb);
+                }
+            });
+        });
+    });
+}
+
+function randomInt(min, max) { // inclusive
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Blackjack core
+const BJ_CARDS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+function newDeck() {
+    const deck = [];
+    for (let s = 0; s < 4; s++) {
+        for (const c of BJ_CARDS) deck.push(c);
+    }
+    // shuffle
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    return deck;
+}
+function cardValue(c) { if (c === 'A') return 11; if (['K','Q','J','10'].includes(c)) return 10; return Number(c); }
+function handValue(cards) {
+    let total = 0, aces = 0;
+    for (const c of cards) { const v = cardValue(c); total += v; if (c === 'A') aces++; }
+    while (total > 21 && aces > 0) { total -= 10; aces--; }
+    return total;
+}
+function handEmoji(cards) { return cards.map(c => `🃏${c}`).join(' '); }
+
+async function updateBlackjackMessage(interaction, state, note) {
+    const playerVal = handValue(state.player);
+    const dealerVal = handValue([state.dealer[0]]);
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('🃏 Blackjack — Dealer')
+        .setDescription(`Dealer: ${handEmoji([state.dealer[0]])} 🂠 (total: ${dealerVal}?)\nYou: ${handEmoji(state.player)} (total: ${playerVal})\n\n${note || ''}`)
+        .setFooter({ text: `Bet: ${state.bet}` });
+    await interaction.editReply({ embeds: [embed] });
+}
+
+async function resolveBlackjack(interaction, state, action, fromTimeout = false) {
+    state.ended = true;
+    activeBlackjack.delete(state.userId);
+    // Dealer draws to 17
+    while (handValue(state.dealer) < 17) {
+        state.dealer.push(state.deck.pop());
+    }
+    const pv = handValue(state.player);
+    const dv = handValue(state.dealer);
+    let outcome = 'lose';
+    let payout = 0;
+    if (action === 'surrender') { outcome = 'surrender'; payout = Math.floor(state.bet / 2); }
+    else if (pv > 21) outcome = 'bust';
+    else if (dv > 21) { outcome = 'win'; payout = state.bet * 2; }
+    else if (pv > dv) { outcome = 'win'; payout = state.bet * 2; }
+    else if (pv === dv) { outcome = 'push'; payout = state.bet; }
+    // Blackjack check (two-card 21) — bonus 2.5x
+    if (pv === 21 && state.player.length === 2) { outcome = 'blackjack'; payout = Math.floor(state.bet * 2.5); }
+
+    const descLines = [];
+    if (fromTimeout) descLines.push('⏳ You took too long! Dealer automatically stands.');
+    descLines.push(`Dealer: ${handEmoji(state.dealer)} (total: ${dv})`);
+    descLines.push(`You: ${handEmoji(state.player)} (total: ${pv})`);
+    const resultText = outcome === 'win' ? `You won ${payout - state.bet} (payout ${payout})!` :
+                      outcome === 'push' ? `It's a push. Refunded ${payout}.` :
+                      outcome === 'blackjack' ? `Blackjack! You won ${payout - state.bet} (payout ${payout})!` :
+                      outcome === 'surrender' ? `You surrendered. Refunded ${payout}.` :
+                      `You lost ${state.bet}.`;
+    descLines.push(resultText);
+
+    const embed = new EmbedBuilder()
+        .setColor(outcome === 'lose' ? '#c62828' : '#00c853')
+        .setTitle('🃏 Blackjack — Result')
+        .setDescription(descLines.join('\n'))
+        .setFooter({ text: `Bet: ${state.bet}` });
+    await interaction.editReply({ embeds: [embed], components: [] });
+
+    if (payout > 0) {
+        await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
+    }
+}
+
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
@@ -274,6 +427,50 @@ function sendVouchAwardMessage(message, username, pointsAwarded, totalPoints) {
 
 // Slash command to check vouch points
 client.on('interactionCreate', async (interaction) => {
+    // Handle Blackjack buttons
+    if (interaction.isButton()) {
+        try {
+            const id = interaction.customId || '';
+            if (!id.startsWith('bj_')) return;
+            const [, action, ownerId] = id.split(':');
+            if (interaction.user.id !== ownerId) {
+                await interaction.reply({ content: 'This is not your game.', ephemeral: true });
+                return;
+            }
+            const state = activeBlackjack.get(ownerId);
+            if (!state) { await interaction.reply({ content: 'No active game found.', ephemeral: true }); return; }
+            if (state.ended) { await interaction.reply({ content: 'Game already finished.', ephemeral: true }); return; }
+            if (action === 'hit') {
+                state.player.push(state.deck.pop());
+                const pv = handValue(state.player);
+                if (pv >= 21) {
+                    await resolveBlackjack(interaction, state, 'stand');
+                } else {
+                    await updateBlackjackMessage(interaction, state, `🃏 You hit...`);
+                }
+            } else if (action === 'stand') {
+                await resolveBlackjack(interaction, state, 'stand');
+            } else if (action === 'double') {
+                // Deduct additional bet if possible
+                const bal = await getUserBalance(ownerId);
+                if (bal < state.bet) {
+                    await interaction.reply({ content: 'Not enough points to double.', ephemeral: true });
+                    return;
+                }
+                await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_double_bet', { bet: state.bet });
+                state.bet *= 2;
+                state.player.push(state.deck.pop());
+                await resolveBlackjack(interaction, state, 'stand');
+            } else if (action === 'surrender') {
+                await resolveBlackjack(interaction, state, 'surrender');
+            }
+        } catch (e) {
+            console.error('Blackjack button error:', e);
+            try { await interaction.reply({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
+        }
+        return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
     
     if (interaction.commandName === 'vouchpoints') {
@@ -343,6 +540,169 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
         });
+    }
+
+    // Blackjack command
+    if (interaction.commandName === 'blackjack') {
+        try {
+            if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
+            const cd = onCooldown('bj:' + interaction.user.id, BLACKJACK_COOLDOWN_MS);
+            if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
+            if (activeBlackjack.has(interaction.user.id)) { await interaction.reply({ content: 'You already have an active blackjack round.', ephemeral: true }); return; }
+            const bet = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
+            const balance = await getUserBalance(interaction.user.id);
+            if (bet <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
+            if (balance < bet) { await interaction.reply({ content: 'Insufficient points.', ephemeral: true }); return; }
+            // Deduct bet upfront
+            await changeUserBalance(interaction.user.id, interaction.user.username, -bet, 'blackjack_bet', { bet });
+            setCooldown('bj:' + interaction.user.id);
+
+            const deck = newDeck();
+            const player = [deck.pop(), deck.pop()];
+            const dealer = [deck.pop(), deck.pop()];
+            const state = { userId: interaction.user.id, bet, deck, player, dealer, startedAt: Date.now(), ended: false };
+            activeBlackjack.set(interaction.user.id, state);
+
+            const playerVal = handValue(player);
+            const dealerVal = handValue([dealer[0]]);
+            const embed = new EmbedBuilder()
+                .setColor('#2b2d31')
+                .setTitle('🃏 Blackjack — Dealer')
+                .setDescription(`Dealer: ${handEmoji([dealer[0]])} 🂠 (total: ${dealerVal}?)\nYou: ${handEmoji(player)} (total: ${playerVal})\n\n"Shuffling the deck... dealing your cards…"`)
+                .setFooter({ text: `Bet: ${bet}` });
+            const components = [
+                {
+                    type: 1,
+                    components: [
+                        { type: 2, style: 1, label: 'Hit', custom_id: `bj_hit:${interaction.user.id}` },
+                        { type: 2, style: 2, label: 'Stand', custom_id: `bj_stand:${interaction.user.id}` },
+                        { type: 2, style: 3, label: 'Double', custom_id: `bj_double:${interaction.user.id}` },
+                        { type: 2, style: 4, label: 'Surrender', custom_id: `bj_surrender:${interaction.user.id}` },
+                    ]
+                }
+            ];
+            await interaction.reply({ embeds: [embed], components });
+
+            // Auto-timeout to stand after 30s
+            setTimeout(async () => {
+                const s = activeBlackjack.get(interaction.user.id);
+                if (!s || s.ended) return;
+                await resolveBlackjack(interaction, s, 'stand', true);
+            }, 30000);
+        } catch (e) {
+            console.error('Blackjack start error:', e);
+            // Refund if failed
+            // Best-effort refund: we don't know bet if failure early — ignored here
+            try { await interaction.reply({ content: '❌ Failed to start game.', ephemeral: true }); } catch {}
+        }
+        return;
+    }
+
+    // Roulette command
+    if (interaction.commandName === 'roulette') {
+        try {
+            if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
+            const cd = onCooldown('roulette:' + interaction.user.id, ROULETTE_COOLDOWN_MS);
+            if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
+            const amount = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
+            const balance = await getUserBalance(interaction.user.id);
+            if (amount <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
+            if (balance < amount) { await interaction.reply({ content: 'Insufficient points.', ephemeral: true }); return; }
+            const betType = interaction.options.getString('type');
+            const number = interaction.options.getInteger('number');
+            await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'roulette_bet', { bet: amount, betType, number });
+            setCooldown('roulette:' + interaction.user.id);
+
+            await interaction.reply({ content: `🎡 Spinning the wheel...`, ephemeral: false });
+            await new Promise(r => setTimeout(r, 1200));
+            const result = randomInt(0, 36);
+            const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+            const color = result === 0 ? 'green' : (redSet.has(result) ? 'red' : 'black');
+            let win = 0;
+            if (betType === 'red' || betType === 'black') { if (color === betType) win = amount * 2; }
+            else if (betType === 'even' || betType === 'odd') { if (result !== 0 && (result % 2 === 0) === (betType === 'even')) win = amount * 2; }
+            else if (betType === 'low' || betType === 'high') { if (result !== 0 && ((betType==='low' && result<=18) || (betType==='high' && result>=19))) win = amount * 2; }
+            else if (betType === 'number' && Number.isInteger(number) && number >= 0 && number <= 36) { if (result === number) win = amount * 35; }
+
+            const embed = new EmbedBuilder()
+                .setColor(win > 0 ? '#00c853' : '#c62828')
+                .setTitle('🎡 Roulette')
+                .setDescription(`Result: ${result} ${color === 'red' ? '🔴' : color === 'black' ? '⚫' : '🟢'}\n` +
+                                (win > 0 ? `You won ${win - amount} (payout ${win})!` : `You lost ${amount}.`))
+                .setFooter({ text: `Bet: ${amount}` });
+            await interaction.editReply({ content: undefined, embeds: [embed] });
+            if (win > 0) {
+                await changeUserBalance(interaction.user.id, interaction.user.username, win, 'roulette_payout', { result });
+            }
+        } catch (e) {
+            console.error('Roulette error:', e);
+            try { await interaction.reply({ content: '❌ Error playing roulette.', ephemeral: true }); } catch {}
+        }
+        return;
+    }
+
+    // Slots command
+    if (interaction.commandName === 'slots') {
+        try {
+            if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
+            const cd = onCooldown('slots:' + interaction.user.id, SLOTS_COOLDOWN_MS);
+            if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
+            const amount = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
+            const balance = await getUserBalance(interaction.user.id);
+            if (amount <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
+            if (balance < amount) { await interaction.reply({ content: 'Insufficient points.', ephemeral: true }); return; }
+            await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'slots_bet', { bet: amount });
+            setCooldown('slots:' + interaction.user.id);
+
+            const symbols = ['🍒','🍋','💎','🔔','7️⃣','🃏'];
+            const weights = [30, 25, 15, 15, 10, 5]; // sum=100; 🃏 is rare
+            function spin() {
+                const roll = () => {
+                    let r = Math.random() * 100, acc = 0;
+                    for (let i = 0; i < symbols.length; i++) { acc += weights[i]; if (r <= acc) return symbols[i]; }
+                    return symbols[0];
+                };
+                return [roll(), roll(), roll()];
+            }
+
+            await interaction.reply({ content: '🎰 Spinning…' });
+            await new Promise(r => setTimeout(r, 700));
+            const [a,b,c] = spin();
+            let payout = 0;
+            if (a === b && b === c) payout = amount * 10;
+            else if (a === b || b === c || a === c) payout = amount * 2;
+            const desc = `Result: ${a} | ${b} | ${c}\n` + (payout > 0 ? `You won ${payout - amount} (payout ${payout})!` : `You lost ${amount}.`);
+            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setTitle('🎰 Slots').setDescription(desc).setFooter({ text: `Bet: ${amount}` });
+            await interaction.editReply({ content: undefined, embeds: [embed] });
+            if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
+
+        } catch (e) {
+            console.error('Slots error:', e);
+            try { await interaction.reply({ content: '❌ Error playing slots.', ephemeral: true }); } catch {}
+        }
+        return;
+    }
+
+    // Casino leaderboard
+    if (interaction.commandName === 'casinoleaderboard') {
+        try {
+            db.all("SELECT user_id, SUM(delta) AS net FROM ledger WHERE reason LIKE 'blackjack_%' OR reason LIKE 'roulette_%' OR reason LIKE 'slots_%' GROUP BY user_id ORDER BY net DESC LIMIT 10", [], async (err, rows) => {
+                if (err) { console.error('Ledger query error:', err); await interaction.reply({ content: '❌ Error.', ephemeral: true }); return; }
+                if (!rows || rows.length === 0) { await interaction.reply({ content: 'No casino activity yet.', ephemeral: true }); return; }
+                let text = '';
+                for (let i = 0; i < rows.length; i++) {
+                    const { user_id, net } = rows[i];
+                    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
+                    text += `${medal} <@${user_id}> — ${net >= 0 ? '+' : ''}${net}\n`;
+                }
+                const embed = new EmbedBuilder().setColor('#ffd700').setTitle('🏆 Casino Leaderboard').setDescription(text);
+                await interaction.reply({ embeds: [embed] });
+            });
+        } catch (e) {
+            console.error('Casino leaderboard error:', e);
+            try { await interaction.reply({ content: '❌ Error.', ephemeral: true }); } catch {}
+        }
+        return;
     }
 
     if (interaction.commandName === 'recountvouches') {
@@ -614,6 +974,26 @@ client.once('ready', async () => {
             ]
         },
         { name: 'leaderboard', description: 'View the vouch points leaderboard' },
+        { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
+        {
+            name: 'blackjack',
+            description: 'Play blackjack against the dealer',
+            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
+        },
+        {
+            name: 'roulette',
+            description: 'Spin the roulette wheel',
+            options: [
+                { name: 'type', description: 'Bet type (red, black, even, odd, low, high, number)', type: 3, required: true },
+                { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true },
+                { name: 'number', description: 'Number (0-36) required for type=number', type: 4, required: false }
+            ]
+        },
+        {
+            name: 'slots',
+            description: 'Pull the lever on slots',
+            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
+        },
         {
             name: 'recountvouches',
             description: 'Admin: Recount all vouches in vouch channels and rebuild points',
