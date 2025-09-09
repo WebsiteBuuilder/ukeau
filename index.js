@@ -49,6 +49,25 @@ db.serialize(() => {
     )`);
 });
 
+// Ensure username column exists on vouch_points (for persistent display names)
+function ensureUsernameColumn() {
+    return new Promise((resolve) => {
+        db.all('PRAGMA table_info(vouch_points)', (err, rows) => {
+            if (err) {
+                console.error('PRAGMA table_info error:', err);
+                resolve();
+                return;
+            }
+            const hasUsername = rows?.some(r => String(r.name).toLowerCase() === 'username');
+            if (hasUsername) { resolve(); return; }
+            db.run('ALTER TABLE vouch_points ADD COLUMN username TEXT', (e2) => {
+                if (e2) console.warn('Could not add username column (may already exist):', e2.message);
+                resolve();
+            });
+        });
+    });
+}
+
 // Bot ready event
 // Settings helpers
 function getSetting(key, defaultValue) {
@@ -148,6 +167,7 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
+    await ensureUsernameColumn();
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
 });
@@ -206,7 +226,7 @@ async function awardVouchPoint(message) {
             
             if (row) {
                 // Update existing user's points
-                db.run('UPDATE vouch_points SET points = points + ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?', [pointsToAdd, userId], function(err) {
+                db.run('UPDATE vouch_points SET points = points + ?, username = ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?', [pointsToAdd, username, userId], function(err) {
                     if (err) {
                         console.error('Database error:', err);
                         reject(err);
@@ -219,7 +239,7 @@ async function awardVouchPoint(message) {
                 });
             } else {
                 // Insert new user with 1 point
-                db.run('INSERT INTO vouch_points (user_id, points) VALUES (?, ?)', [userId, pointsToAdd], function(err) {
+                db.run('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)', [userId, pointsToAdd, username], function(err) {
                     if (err) {
                         console.error('Database error:', err);
                         reject(err);
@@ -259,7 +279,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'vouchpoints') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
         
-        db.get('SELECT points FROM vouch_points WHERE user_id = ?', [targetUser.id], (err, row) => {
+        db.get('SELECT points, username FROM vouch_points WHERE user_id = ?', [targetUser.id], (err, row) => {
             if (err) {
                 console.error('Database error:', err);
                 interaction.reply({ content: '❌ Error retrieving vouch points!', ephemeral: true });
@@ -270,7 +290,7 @@ client.on('interactionCreate', async (interaction) => {
             const embed = new EmbedBuilder()
                 .setColor('#0099ff')
                 .setTitle('📊 Vouch Points')
-                .setDescription(`${targetUser.username} has **${points}** vouch points!`)
+                .setDescription(`${(row?.username) || targetUser.username} has **${points}** vouch points!`)
                 .setThumbnail(targetUser.displayAvatarURL())
                 .setTimestamp();
             
@@ -303,7 +323,7 @@ client.on('interactionCreate', async (interaction) => {
             const delta = interaction.commandName === 'addpoints' ? amount : -amount;
             if (row) {
                 const newPoints = Math.max(0, row.points + delta);
-                db.run('UPDATE vouch_points SET points = ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?', [newPoints, targetUser.id], (err2) => {
+                db.run('UPDATE vouch_points SET points = ?, username = ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?', [newPoints, targetUser.username, targetUser.id], (err2) => {
                     if (err2) {
                         console.error('Database error:', err2);
                         interaction.reply({ content: '❌ Error updating points.', ephemeral: true });
@@ -313,7 +333,7 @@ client.on('interactionCreate', async (interaction) => {
                 });
             } else {
                 const initial = Math.max(0, delta);
-                db.run('INSERT INTO vouch_points (user_id, points) VALUES (?, ?)', [targetUser.id, initial], (err3) => {
+                db.run('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)', [targetUser.id, initial, targetUser.username], (err3) => {
                     if (err3) {
                         console.error('Database error:', err3);
                         interaction.reply({ content: '❌ Error updating points.', ephemeral: true });
@@ -420,9 +440,11 @@ client.on('interactionCreate', async (interaction) => {
                 db.serialize(() => {
                     db.run('BEGIN TRANSACTION');
                     db.run('DELETE FROM vouch_points');
-                    const stmt = db.prepare('INSERT INTO vouch_points (user_id, points) VALUES (?, ?)');
+                    const stmt = db.prepare('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)');
                     for (const [uid, count] of userIdToCount.entries()) {
-                        stmt.run(uid, count);
+                        const u = await interaction.client.users.fetch(uid).catch(() => null);
+                        const uname = u?.username || 'Unknown User';
+                        stmt.run(uid, count, uname);
                     }
                     stmt.finalize((err) => {
                         if (err) {
@@ -527,7 +549,7 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
     if (interaction.commandName === 'vouchleaderboard' || interaction.commandName === 'leaderboard') {
-        db.all('SELECT user_id, points FROM vouch_points ORDER BY points DESC LIMIT 10', [], (err, rows) => {
+        db.all('SELECT user_id, points, username FROM vouch_points ORDER BY points DESC LIMIT 10', [], (err, rows) => {
             if (err) {
                 console.error('Database error:', err);
                 interaction.reply({ content: '❌ Error retrieving leaderboard!', ephemeral: true });
@@ -542,7 +564,7 @@ client.on('interactionCreate', async (interaction) => {
             let leaderboardText = '';
             for (let i = 0; i < rows.length; i++) {
                 const user = client.users.cache.get(rows[i].user_id);
-                const username = user ? user.username : 'Unknown User';
+                const username = rows[i].username || (user ? user.username : 'Unknown User');
                 const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
                 leaderboardText += `${medal} **${i + 1}.** ${username} - ${rows[i].points} points\n`;
             }
