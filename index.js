@@ -435,15 +435,25 @@ client.on('interactionCreate', async (interaction) => {
                 }
             }
 
+            // Prefetch usernames before DB transaction to avoid using await inside callbacks
+            const entries = await Promise.all(
+                Array.from(userIdToCount.entries()).map(async ([uid, count]) => {
+                    let uname = 'Unknown User';
+                    try {
+                        const u = await interaction.client.users.fetch(uid);
+                        if (u && u.username) uname = u.username;
+                    } catch {}
+                    return [uid, count, uname];
+                })
+            );
+
             // Write results to DB (multiplier not applied for recount; base 1 per valid vouch)
             await new Promise((resolve, reject) => {
                 db.serialize(() => {
                     db.run('BEGIN TRANSACTION');
                     db.run('DELETE FROM vouch_points');
                     const stmt = db.prepare('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)');
-                    for (const [uid, count] of userIdToCount.entries()) {
-                        const u = await interaction.client.users.fetch(uid).catch(() => null);
-                        const uname = u?.username || 'Unknown User';
+                    for (const [uid, count, uname] of entries) {
                         stmt.run(uid, count, uname);
                     }
                     stmt.finalize((err) => {
