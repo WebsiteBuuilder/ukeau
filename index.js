@@ -400,10 +400,12 @@ async function resolveBlackjack(interaction, state, action, fromTimeout = false)
                       `You lost ${state.bet}.`;
     descLines.push(resultText);
 
+    const net = payout - state.bet;
+    const breakdown = `\nBet: ${state.bet} • Payout: ${payout} • Net: ${net >= 0 ? '+' : ''}${net}`;
     const embed = new EmbedBuilder()
         .setColor(outcome === 'lose' ? '#c62828' : '#00c853')
         .setTitle('🃏 Blackjack — Result')
-        .setDescription(descLines.join('\n'))
+        .setDescription(descLines.join('\n') + breakdown)
         .setFooter({ text: `Bet: ${state.bet}` });
     await sendOrUpdate(interaction, { embeds: [embed], components: [] });
 
@@ -659,12 +661,10 @@ client.on('interactionCreate', async (interaction) => {
             const state = { userId: interaction.user.id, bet, deck, player, dealer, startedAt: Date.now(), ended: false };
             activeBlackjack.set(interaction.user.id, state);
 
-            const playerVal = handValue(player);
-            const dealerVal = handValue([dealer[0]]);
             const embed = new EmbedBuilder()
                 .setColor('#2b2d31')
                 .setTitle('🃏 Blackjack — Dealer')
-                .setDescription(`Dealer: ${handEmoji([dealer[0]])} 🂠 (total: ${dealerVal}?)\nYou: ${handEmoji(player)} (total: ${playerVal})\n\n"Shuffling the deck... dealing your cards…"`)
+                .setDescription('Preparing the high‑stakes table…')
                 .setFooter({ text: `Bet: ${bet}` });
             const components = [
                 {
@@ -678,6 +678,10 @@ client.on('interactionCreate', async (interaction) => {
                 }
             ];
             await interaction.reply({ embeds: [embed], components });
+
+            // Apply immersive dealing animation and large table right away
+            await animateBlackjackDeal(interaction, state);
+            await updateBlackjackMessage(interaction, state, 'Your move: Hit, Stand, Double, or Surrender.');
 
             // Auto-timeout to stand after 30s
             setTimeout(async () => {
@@ -770,9 +774,11 @@ client.on('interactionCreate', async (interaction) => {
 ║                                      ║
 ║   💎 ONLY IN OUR VIP CASINO 💎      ║
 ╚══════════════════════════════════════╝`;
+            const net = win - amount;
+            const breakdown = `\nBet: ${amount} • Payout: ${win} • Net: ${net>=0?'+':''}${net}`;
             const embed = new EmbedBuilder()
                 .setColor(win > 0 ? '#00c853' : '#c62828')
-                .setDescription(wheelResult)
+                .setDescription(wheelResult + breakdown)
                 .setFooter({ text: `Bet: ${amount} • VIP rewards available` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (win > 0) {
@@ -837,7 +843,9 @@ client.on('interactionCreate', async (interaction) => {
 ║--------------------------------------║
 ║ ${payout>0 ? '💰 JACKPOT! CLAIM YOUR VIP REWARDS 💰' : '😤 MISS! TRY THE VIP LUCK AGAIN'} ║
 ╚══════════════════════════════════════╝`;
-            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox).setFooter({ text: `Bet: ${amount}` });
+            const net = payout - amount;
+            const breakdown = `\nBet: ${amount} • Payout: ${payout} • Net: ${net>=0?'+':''}${net}`;
+            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox + breakdown).setFooter({ text: `Bet: ${amount}` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
 
