@@ -264,6 +264,125 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
+    if (interaction.commandName === 'recountvouches') {
+        if (!interaction.inGuild()) {
+            interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+            return;
+        }
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        if (!isAdmin) {
+            interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+            return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            const targetChannel = interaction.options.getChannel?.('channel') || null;
+            const guild = interaction.guild;
+            const providerRoleId = process.env.PROVIDER_ROLE_ID;
+            const providerRoleName = process.env.PROVIDER_ROLE_NAME || 'Provider';
+            const role = providerRoleId
+                ? guild.roles.cache.get(providerRoleId)
+                : guild.roles.cache.find(r => r.name.toLowerCase() === providerRoleName.toLowerCase());
+            if (!role) {
+                await interaction.editReply('Provider role not found. Set PROVIDER_ROLE_ID or PROVIDER_ROLE_NAME.');
+                return;
+            }
+
+            const channelsToScan = [];
+            if (targetChannel && targetChannel.isTextBased && targetChannel.isTextBased()) {
+                channelsToScan.push(targetChannel);
+            } else {
+                guild.channels.cache.forEach(ch => {
+                    if (ch && ch.isTextBased && ch.isTextBased() && ch.name && ch.name.toLowerCase().includes('vouch')) {
+                        channelsToScan.push(ch);
+                    }
+                });
+            }
+
+            if (channelsToScan.length === 0) {
+                await interaction.editReply('No vouch channels found to scan.');
+                return;
+            }
+
+            const imageTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+            const userIdToCount = new Map();
+            let scannedMessages = 0;
+
+            const isProviderMentioned = async (message) => {
+                if (!message.mentions) return false;
+                if (message.mentions.members && message.mentions.members.some(m => m.roles.cache.has(role.id))) return true;
+                // Fallback: try users -> members
+                const users = message.mentions.users;
+                if (users && users.size > 0) {
+                    for (const [, user] of users) {
+                        const member = guild.members.cache.get(user.id) || await guild.members.fetch(user.id).catch(() => null);
+                        if (member && member.roles.cache.has(role.id)) return true;
+                    }
+                }
+                return false;
+            };
+
+            const hasImage = (message) => {
+                if (!message.attachments || message.attachments.size === 0) return false;
+                return message.attachments.some(att => {
+                    if (att.contentType && imageTypes.includes(att.contentType)) return true;
+                    const ext = (att.name || '').toLowerCase();
+                    return ['.jpg', '.jpeg', '.png', '.gif', '.webp'].some(e => ext.endsWith(e));
+                });
+            };
+
+            for (const ch of channelsToScan) {
+                let lastId = undefined;
+                // Iterate through history
+                while (true) {
+                    const batch = await ch.messages.fetch({ limit: 100, before: lastId }).catch(() => null);
+                    if (!batch || batch.size === 0) break;
+                    for (const [, msg] of batch) {
+                        scannedMessages++;
+                        if (msg.author?.bot) continue;
+                        if (!hasImage(msg)) continue;
+                        // Must mention at least one provider
+                        // eslint-disable-next-line no-await-in-loop
+                        const providerOk = await isProviderMentioned(msg);
+                        if (!providerOk) continue;
+                        const uid = msg.author.id;
+                        userIdToCount.set(uid, (userIdToCount.get(uid) || 0) + 1);
+                    }
+                    lastId = batch.last().id;
+                }
+            }
+
+            // Write results to DB (multiplier not applied for recount; base 1 per valid vouch)
+            await new Promise((resolve, reject) => {
+                db.serialize(() => {
+                    db.run('BEGIN TRANSACTION');
+                    db.run('DELETE FROM vouch_points');
+                    const stmt = db.prepare('INSERT INTO vouch_points (user_id, points) VALUES (?, ?)');
+                    for (const [uid, count] of userIdToCount.entries()) {
+                        stmt.run(uid, count);
+                    }
+                    stmt.finalize((err) => {
+                        if (err) {
+                            db.run('ROLLBACK');
+                            reject(err);
+                            return;
+                        }
+                        db.run('COMMIT', (err2) => {
+                            if (err2) reject(err2);
+                            else resolve();
+                        });
+                    });
+                });
+            });
+
+            await interaction.editReply(`✅ Recount complete. Scanned ${scannedMessages} messages across ${channelsToScan.length} channel(s). Updated ${userIdToCount.size} user(s).`);
+        } catch (e) {
+            console.error('Recount error:', e);
+            await interaction.editReply('❌ Error during recount. Check logs.');
+        }
+    }
     if (interaction.commandName === 'setmultiplier') {
         if (!interaction.inGuild()) {
             interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
@@ -346,6 +465,15 @@ client.once('ready', async () => {
             ]
         },
         { name: 'leaderboard', description: 'View the vouch points leaderboard' },
+        {
+            name: 'recountvouches',
+            description: 'Admin: Recount all vouches in vouch channels and rebuild points',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                { name: 'channel', description: 'Specific vouch channel to scan (optional)', type: 7, required: false }
+            ]
+        },
         {
             name: 'addpoints',
             description: 'Admin: Add points to a user',
