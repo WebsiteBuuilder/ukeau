@@ -573,10 +573,18 @@ client.on('interactionCreate', async (interaction) => {
             
             let leaderboardText = '';
             for (let i = 0; i < rows.length; i++) {
-                const user = client.users.cache.get(rows[i].user_id);
-                const username = rows[i].username || (user ? user.username : 'Unknown User');
+                const { user_id, points, username } = rows[i];
                 const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
-                leaderboardText += `${medal} **${i + 1}.** ${username} - ${rows[i].points} points\n`;
+                // Use mention to always resolve current display name; still show points
+                leaderboardText += `${medal} **${i + 1}.** <@${user_id}> - ${points} points\n`;
+                // Backfill username in DB if missing
+                if (!username) {
+                    client.users.fetch(user_id).then(u => {
+                        if (u && u.username) {
+                            db.run('UPDATE vouch_points SET username = ? WHERE user_id = ?', [u.username, user_id], () => {});
+                        }
+                    }).catch(() => {});
+                }
             }
             
             const embed = new EmbedBuilder()
