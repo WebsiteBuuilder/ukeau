@@ -174,7 +174,7 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
 }
 
 // Casino helpers
-const activeBlackjack = new Map(); // userId -> state
+const bjGames = new Map(); // userId -> state
 const activeCooldowns = new Map(); // key -> timestamp
 const BLACKJACK_COOLDOWN_MS = 10 * 1000;
 const ROULETTE_COOLDOWN_MS = 10 * 1000;
@@ -295,113 +295,113 @@ async function editGameMessage(state, payload) {
     } catch {}
 }
 
-function buildBJDescription(state, reveal, note) {
-    const pr = Math.min(reveal?.player ?? state.player.length, state.player.length);
-    const dr = Math.min(reveal?.dealer ?? 1, state.dealer.length);
-    const playerShown = pr > 0 ? handEmoji(state.player.slice(0, pr)) : '';
-    const playerHidden = pr < state.player.length ? (' ' + hidden(state.player.length - pr)) : '';
-    const dealerShown = dr > 0 ? handEmoji(state.dealer.slice(0, dr)) : '';
-    const dealerHidden = dr < state.dealer.length ? (' ' + hidden(state.dealer.length - dr)) : '';
-    const pv = handValue(state.player.slice(0, pr));
-    const dv = handValue(state.dealer.slice(0, Math.max(1, dr)));
-    const lines = [];
-    lines.push(`Dealer: ${dealerShown}${dealerHidden} (total: ${dr >= state.dealer.length ? handValue(state.dealer) : dv}?)`);
-    lines.push(`You: ${playerShown}${playerHidden} (total: ${pr >= state.player.length ? handValue(state.player) : pv}?)`);
-    if (note) lines.push(note);
-    return lines.join('\n');
-}
-
-function normalizeRank(c) { return c; }
-function canSplit(state) {
-    if (state.split) return false;
-    if (!state.player || state.player.length !== 2) return false;
-    return normalizeRank(state.player[0]) === normalizeRank(state.player[1]);
-}
-
-function buildBJComponents(state) {
-    const components = [];
-    const base = [];
-    base.push({ type: 2, style: 1, label: 'Hit', custom_id: `bj_hit:${state.userId}` });
-    base.push({ type: 2, style: 2, label: 'Stand', custom_id: `bj_stand:${state.userId}` });
-    if (!state.split) {
-        base.push({ type: 2, style: 3, label: 'Double', custom_id: `bj_double:${state.userId}` });
-        if (canSplit(state)) {
-            base.push({ type: 2, style: 1, label: 'Split', custom_id: `bj_split:${state.userId}` });
-        }
-        base.push({ type: 2, style: 4, label: 'Surrender', custom_id: `bj_surrender:${state.userId}` });
+// =============== NEW BLACKJACK (Player-friendly) ===============
+function bjCreateShoe(numDecks = 4) {
+    const deck = [];
+    for (let d = 0; d < numDecks * 4; d++) {
+        for (const c of BJ_CARDS) deck.push(c);
     }
-    components.push({ type: 1, components: base });
-    return components;
-}
-
-async function animateBlackjackDeal(interaction, state) {
-    // Shuffling animation
-    for (const dots of ['Shuffling.','Shuffling..','Shuffling...']) {
-        const embed = new EmbedBuilder()
-            .setColor('#2b2d31')
-            .setTitle('🃏 Blackjack — Dealer')
-            .setDescription(`${dots}`)
-            .setFooter({ text: `Bet: ${state.bet}` });
-        await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
-        await delay(300);
+    // shuffle
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
     }
-    // Reveal sequence: player first card, then second, dealer upcard
-    for (const step of [ { p: 1, d: 1 }, { p: 2, d: 1 } ]) {
-        const embed = new EmbedBuilder()
-            .setColor('#2b2d31')
-            .setTitle('🃏 Blackjack — Dealer')
-            .setDescription(buildBJDescription(state, { player: step.p, dealer: step.d }, 'Dealing...'))
-            .setFooter({ text: `Bet: ${state.bet}` });
-        await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
-        await delay(350);
+    return deck;
+}
+
+function bjDraw(state) {
+    if (!state.shoe || state.shoe.length < 15) {
+        state.shoe = bjCreateShoe();
     }
+    return state.shoe.pop();
 }
 
-async function animateBlackjackHit(interaction, state) {
-    const embed = new EmbedBuilder()
-        .setColor('#2b2d31')
-        .setTitle('🃏 Blackjack — Dealer')
-        .setDescription(buildBJDescription(state, { player: state.player.length - 1, dealer: 1 }, 'Drawing a card…'))
-        .setFooter({ text: `Bet: ${state.bet}` });
-    await editGameMessage(state, { embeds: [embed] });
-    await delay(300);
-    await updateBlackjackMessage(interaction, state, 'You hit.');
+function bjCanDouble(state) {
+    return !state.ended && state.player.length === 2 && !state.doubled;
 }
 
-async function updateBlackjackMessage(interaction, state, note) {
-    const header = [
+function bjBuildEmbed(state, opts = {}) {
+    const hideDealerHole = !!opts.hideDealerHole;
+    const dealerShown = hideDealerHole ? [state.dealer[0]] : state.dealer.slice();
+    const dealerHiddenCount = hideDealerHole ? (state.dealer.length - 1) : 0;
+    const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
+    const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
+    const playerLine = handEmoji(state.player);
+    const playerTotal = handValue(state.player);
+
+    const table = [
         '╔════════════════════════════════════════════════════════════╗',
-        '║                 🃏 HIGH‑STAKES BLACKJACK 🃏                 ║',
-        '║             💎 VIP EXCLUSIVE • ZERO FLUFF 💎               ║',
+        '║                        BLACKJACK                          ║',
+        '╠════════════════════════════════════════════════════════════╣',
+        `║ Dealer: ${dealerLine.padEnd(52,' ')}║`,
+        `║ Total : ${dealerTotal.padEnd(52,' ')}║`,
+        '╟────────────────────────────────────────────────────────────╢',
+        `║ Player: ${playerLine.padEnd(52,' ')}║`,
+        `║ Total : ${String(playerTotal).padEnd(52,' ')}║`,
         '╚════════════════════════════════════════════════════════════╝'
     ].join('\n');
-    // Large table layout
-    const pr = state.player.length;
-    const dr = 1;
-    const playerLine = buildBJDescription(state, { player: pr, dealer: dr }, '').split('\n')[1] || '';
-    const dealerLineRaw = buildBJDescription(state, { player: pr, dealer: dr }, '').split('\n')[0] || '';
-    const table = [
-        '┌──────────────────────────────────────────────────────────┐',
-        `│ Dealer  │ ${dealerLineRaw.padEnd(48,' ')}│`,
-        '│          └──────────────────────────────────────────────┘',
-        `│ Player  │ ${playerLine.padEnd(48,' ')}│`,
-        '└──────────────────────────────────────────────────────────┘'
-    ].join('\n');
-    const dealerQuip = '\n"New shoe, new luck. Cut clean, play cleaner." — Dealer 😼';
-    const embed = new EmbedBuilder()
+
+    const note = opts.note ? `\n${opts.note}` : '';
+    return new EmbedBuilder()
         .setColor('#2b2d31')
         .setTitle('')
-        .setDescription(`${header}\n\n${table}${dealerQuip}\n\n💎 VIP Rewards active • Play only in this server`)
+        .setDescription(`${table}${note}`)
         .setFooter({ text: `Bet: ${state.bet}` });
-    await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
 }
 
-async function resolveBlackjack(interaction, state, action, fromTimeout = false) {
+function bjComponents(state) {
+    if (state.ended) return [];
+    const comps = [
+        { type: 2, style: 1, label: 'Hit', custom_id: `nbj_hit:${state.userId}` },
+        { type: 2, style: 2, label: 'Stand', custom_id: `nbj_stand:${state.userId}` }
+    ];
+    if (bjCanDouble(state)) comps.push({ type: 2, style: 3, label: 'Double', custom_id: `nbj_double:${state.userId}` });
+    comps.push({ type: 2, style: 4, label: 'Surrender', custom_id: `nbj_surrender:${state.userId}` });
+    return [{ type: 1, components: comps }];
+}
+
+async function bjUpdateView(state, opts = {}) {
+    const embed = bjBuildEmbed(state, opts);
+    await editGameMessage(state, { embeds: [embed], components: bjComponents(state) });
+}
+
+function bjApplyDealerInitialFairness(state) {
+    // If dealer starts with 20/21 too often, soften it by attempting to swap dealer's second card.
+    const dv = handValue(state.dealer);
+    if (dv >= 20) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            // Prefer lower card (<=6) if available in shoe
+            let idx = -1;
+            for (let i = 0; i < state.shoe.length; i++) {
+                const v = cardValue(state.shoe[i]);
+                if (v <= 6) { idx = i; break; }
+            }
+            if (idx === -1) break;
+            const replacement = state.shoe.splice(idx, 1)[0];
+            // Put previous second card back into shoe randomly
+            const prev = state.dealer[1];
+            state.dealer[1] = replacement;
+            // return prev back randomly into shoe
+            const insertPos = Math.floor(Math.random() * (state.shoe.length + 1));
+            state.shoe.splice(insertPos, 0, prev);
+            if (handValue(state.dealer) <= 19) break;
+        }
+    }
+}
+
+async function bjDealInitial(state) {
+    state.player = [bjDraw(state), bjDraw(state)];
+    state.dealer = [bjDraw(state), bjDraw(state)];
+    bjApplyDealerInitialFairness(state);
+}
+
+async function bjResolve(interaction, state, action, fromTimeout = false) {
+    if (state.ended) return;
     state.ended = true;
-    activeBlackjack.delete(state.userId);
-    // Dealer draws to 17
+    bjGames.delete(state.userId);
+    // Dealer draws to 17 (stand on all 17s)
     while (handValue(state.dealer) < 17) {
-        state.dealer.push(state.deck.pop());
+        state.dealer.push(bjDraw(state));
     }
     const pv = handValue(state.player);
     const dv = handValue(state.dealer);
@@ -412,38 +412,31 @@ async function resolveBlackjack(interaction, state, action, fromTimeout = false)
     else if (dv > 21) { outcome = 'win'; payout = state.bet * 2; }
     else if (pv > dv) { outcome = 'win'; payout = state.bet * 2; }
     else if (pv === dv) { outcome = 'push'; payout = state.bet; }
-    // Blackjack check (two-card 21) — bonus 2.5x
+    // Natural blackjack bonus (two-card 21)
     if (pv === 21 && state.player.length === 2) { outcome = 'blackjack'; payout = Math.floor(state.bet * 2.5); }
 
-    const descLines = [];
-    if (fromTimeout) descLines.push('⏳ You took too long! Dealer automatically stands.');
-    descLines.push(`Dealer: ${handEmoji(state.dealer)} (total: ${dv})`);
-    descLines.push(`You: ${handEmoji(state.player)} (total: ${pv})`);
-    const resultText = outcome === 'win' ? `You won ${payout - state.bet} (payout ${payout})!` :
+    const lines = [];
+    if (fromTimeout) lines.push('⏳ You took too long! Dealer automatically stands.');
+    lines.push(`Dealer: ${handEmoji(state.dealer)} (total: ${dv})`);
+    lines.push(`You: ${handEmoji(state.player)} (total: ${pv})`);
+    const resultText = outcome === 'win' ? `You won ${payout - state.bet} (payout ${payout}).` :
                       outcome === 'push' ? `It's a push. Refunded ${payout}.` :
-                      outcome === 'blackjack' ? `Blackjack! You won ${payout - state.bet} (payout ${payout})!` :
+                      outcome === 'blackjack' ? `Blackjack! You won ${payout - state.bet} (payout ${payout}).` :
                       outcome === 'surrender' ? `You surrendered. Refunded ${payout}.` :
                       `You lost ${state.bet}.`;
-    descLines.push(resultText);
-
-    const net = payout - state.bet;
-    const breakdown = `\nBet: ${state.bet} • Payout: ${payout} • Net: ${net >= 0 ? '+' : ''}${net}`;
-    const embed = new EmbedBuilder()
-        .setColor(outcome === 'lose' ? '#c62828' : '#00c853')
-        .setTitle('🃏 Blackjack — Result')
-        .setDescription(descLines.join('\n') + breakdown)
-        .setFooter({ text: `Bet: ${state.bet}` });
+    const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
     await editGameMessage(state, { embeds: [embed], components: [] });
 
     if (payout > 0) {
         await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
     }
-    // Show current balance after game
     try {
         const balance = await getUserBalance(interaction.user.id);
         await interaction.followUp({ content: `Current balance: ${balance} vouch points.`, ephemeral: true });
     } catch {}
 }
+
+// Removed legacy blackjack code above
 
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
@@ -559,45 +552,49 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
         try {
             const id = interaction.customId || '';
-            if (!id.startsWith('bj_')) return;
+            // New blackjack uses nbj_ prefix
+            const isNewBJ = id.startsWith('nbj_');
+            const isOldBJ = id.startsWith('bj_');
+            if (!isNewBJ && !isOldBJ) return;
             const [prefix, ownerId] = id.split(':');
-            const action = prefix.replace('bj_', '');
+            const action = prefix.replace('nbj_', '').replace('bj_', '');
             // Always acknowledge immediately to avoid interaction failure
             if (!interaction.deferred && !interaction.replied) {
                 await interaction.deferUpdate().catch(async () => { try { await interaction.reply({ content: 'Working…', ephemeral: true }); } catch {} });
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
-            const state = activeBlackjack.get(ownerId);
+
+            // Prefer new blackjack state if exists
+            let state = bjGames.get(ownerId);
+            const isLegacyOnly = !state && isOldBJ;
+            if (!state && isLegacyOnly) {
+                try { await interaction.followUp({ content: 'Game was reset to new version. Start a fresh /blackjack.', ephemeral: true }); } catch {}
+                return;
+            }
             if (!state) { try { await interaction.followUp({ content: 'No active game found.', ephemeral: true }); } catch {} return; }
             if (state.ended) { try { await interaction.followUp({ content: 'Game already finished.', ephemeral: true }); } catch {} return; }
+
             if (action === 'hit') {
-                try {
-                    state.player.push(state.deck.pop());
-                    const pv = handValue(state.player);
-                    if (pv >= 21) {
-                        await resolveBlackjack(interaction, state, 'stand');
-                    } else {
-                        await updateBlackjackMessage(interaction, state, `🃏 You hit...`);
-                    }
-                } catch (err) {
-                    console.error('BJ hit update error:', err);
-                    try { await interaction.followUp({ content: 'Temporary display glitch, hand updated.', ephemeral: true }); } catch {}
+                state.player.push(bjDraw(state));
+                const pv = handValue(state.player);
+                if (pv >= 21) {
+                    await bjResolve(interaction, state, 'stand');
+                } else {
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\nYou hit.' });
                 }
             } else if (action === 'stand') {
-                await resolveBlackjack(interaction, state, 'stand');
+                await bjResolve(interaction, state, 'stand');
             } else if (action === 'double') {
-                // Deduct additional bet if possible
+                if (!bjCanDouble(state)) { try { await interaction.followUp({ content: 'Cannot double now.', ephemeral: true }); } catch {} return; }
                 const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) {
-                    try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {}
-                    return;
-                }
+                if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {} return; }
                 await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_double_bet', { bet: state.bet });
                 state.bet *= 2;
-                state.player.push(state.deck.pop());
-                await resolveBlackjack(interaction, state, 'stand');
+                state.doubled = true;
+                state.player.push(bjDraw(state));
+                await bjResolve(interaction, state, 'stand');
             } else if (action === 'surrender') {
-                await resolveBlackjack(interaction, state, 'surrender');
+                await bjResolve(interaction, state, 'surrender');
             }
         } catch (e) {
             console.error('Blackjack button error:', e);
@@ -677,13 +674,13 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
-    // Blackjack command
+    // Blackjack command (new)
     if (interaction.commandName === 'blackjack') {
         try {
             if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
             const cd = onCooldown('bj:' + interaction.user.id, BLACKJACK_COOLDOWN_MS);
             if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
-            if (activeBlackjack.has(interaction.user.id)) { await interaction.reply({ content: 'You already have an active blackjack round.', ephemeral: true }); return; }
+            if (bjGames.has(interaction.user.id)) { await interaction.reply({ content: 'You already have an active blackjack round.', ephemeral: true }); return; }
             const bet = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
             const balance = await getUserBalance(interaction.user.id);
             if (bet <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
@@ -692,25 +689,23 @@ client.on('interactionCreate', async (interaction) => {
             await changeUserBalance(interaction.user.id, interaction.user.username, -bet, 'blackjack_bet', { bet });
             setCooldown('bj:' + interaction.user.id);
 
-            const deck = newDeck();
-            const player = [deck.pop(), deck.pop()];
-            const dealer = [deck.pop(), deck.pop()];
-            const state = { userId: interaction.user.id, bet, deck, player, dealer, startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null };
-            activeBlackjack.set(interaction.user.id, state);
+            const state = { userId: interaction.user.id, bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false };
+            bjGames.set(interaction.user.id, state);
+            await bjDealInitial(state);
 
             const embed = new EmbedBuilder()
                 .setColor('#2b2d31')
                 .setTitle('🃏 Blackjack — Dealer')
-                .setDescription('Preparing the high‑stakes table…')
+                .setDescription('Preparing the table…')
                 .setFooter({ text: `Bet: ${bet}` });
             const components = [
                 {
                     type: 1,
                     components: [
-                        { type: 2, style: 1, label: 'Hit', custom_id: `bj_hit:${interaction.user.id}` },
-                        { type: 2, style: 2, label: 'Stand', custom_id: `bj_stand:${interaction.user.id}` },
-                        { type: 2, style: 3, label: 'Double', custom_id: `bj_double:${interaction.user.id}` },
-                        { type: 2, style: 4, label: 'Surrender', custom_id: `bj_surrender:${interaction.user.id}` },
+                        { type: 2, style: 1, label: 'Hit', custom_id: `nbj_hit:${interaction.user.id}` },
+                        { type: 2, style: 2, label: 'Stand', custom_id: `nbj_stand:${interaction.user.id}` },
+                        { type: 2, style: 3, label: 'Double', custom_id: `nbj_double:${interaction.user.id}` },
+                        { type: 2, style: 4, label: 'Surrender', custom_id: `nbj_surrender:${interaction.user.id}` },
                     ]
                 }
             ];
@@ -726,16 +721,14 @@ client.on('interactionCreate', async (interaction) => {
                     if (last) state.messageId = last.id;
                 } catch {}
             }
-
-            // Apply immersive dealing animation and large table right away
-            await animateBlackjackDeal(interaction, state);
-            await updateBlackjackMessage(interaction, state, 'Your move: Hit, Stand, Double, or Surrender.');
+            // Show initial view
+            await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' });
 
             // Auto-timeout to stand after 30s
             setTimeout(async () => {
-                const s = activeBlackjack.get(interaction.user.id);
+                const s = bjGames.get(interaction.user.id);
                 if (!s || s.ended) return;
-                await resolveBlackjack(interaction, s, 'stand', true);
+                await bjResolve(interaction, s, 'stand', true);
             }, 30000);
         } catch (e) {
             console.error('Blackjack start error:', e);
