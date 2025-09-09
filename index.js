@@ -287,7 +287,8 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendOrUpdate(interaction, payload) {
     if (interaction.isButton && interaction.isButton()) {
-        return interaction.update(payload).catch(() => {});
+        // Prefer editing the existing message after deferring update
+        return interaction.editReply(payload).catch(() => {});
     }
     return interaction.editReply(payload).catch(() => {});
 }
@@ -412,6 +413,11 @@ async function resolveBlackjack(interaction, state, action, fromTimeout = false)
     if (payout > 0) {
         await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
     }
+    // Show current balance after game
+    try {
+        const balance = await getUserBalance(interaction.user.id);
+        await interaction.followUp({ content: `Current balance: ${balance} vouch points.`, ephemeral: true });
+    } catch {}
 }
 
 client.once('ready', async () => {
@@ -539,12 +545,17 @@ client.on('interactionCreate', async (interaction) => {
             if (!state) { await interaction.reply({ content: 'No active game found.', ephemeral: true }); return; }
             if (state.ended) { await interaction.reply({ content: 'Game already finished.', ephemeral: true }); return; }
             if (action === 'hit') {
-                state.player.push(state.deck.pop());
-                const pv = handValue(state.player);
-                if (pv >= 21) {
-                    await resolveBlackjack(interaction, state, 'stand');
-                } else {
-                    await updateBlackjackMessage(interaction, state, `🃏 You hit...`);
+                try {
+                    state.player.push(state.deck.pop());
+                    const pv = handValue(state.player);
+                    if (pv >= 21) {
+                        await resolveBlackjack(interaction, state, 'stand');
+                    } else {
+                        await updateBlackjackMessage(interaction, state, `🃏 You hit...`);
+                    }
+                } catch (err) {
+                    console.error('BJ hit update error:', err);
+                    try { await interaction.followUp({ content: 'Temporary display glitch, hand updated.', ephemeral: true }); } catch {}
                 }
             } else if (action === 'stand') {
                 await resolveBlackjack(interaction, state, 'stand');
@@ -781,6 +792,8 @@ client.on('interactionCreate', async (interaction) => {
                 .setDescription(wheelResult + breakdown)
                 .setFooter({ text: `Bet: ${amount} • VIP rewards available` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
+            // Balance after roulette
+            try { const bal = await getUserBalance(interaction.user.id); await interaction.followUp({ content: `Current balance: ${bal} vouch points.`, ephemeral: true }); } catch {}
             if (win > 0) {
                 await changeUserBalance(interaction.user.id, interaction.user.username, win, 'roulette_payout', { result });
             }
@@ -848,6 +861,8 @@ client.on('interactionCreate', async (interaction) => {
             const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox + breakdown).setFooter({ text: `Bet: ${amount}` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
+            // Balance after slots
+            try { const bal = await getUserBalance(interaction.user.id); await interaction.followUp({ content: `Current balance: ${bal} vouch points.`, ephemeral: true }); } catch {}
 
         } catch (e) {
             console.error('Slots error:', e);
