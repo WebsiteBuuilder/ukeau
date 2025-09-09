@@ -324,10 +324,18 @@ async function animateBlackjackHit(interaction, state) {
 }
 
 async function updateBlackjackMessage(interaction, state, note) {
+    const header = [
+        '╔══════════════════════════════════════╗',
+        '║        🃏 HIGH-STAKES BLACKJACK 🃏     ║',
+        '║      💎 VIP TABLE — HOUSE EDGE 0.5%   ║',
+        '╚══════════════════════════════════════╝'
+    ].join('\n');
+    const body = buildBJDescription(state, { player: state.player.length, dealer: 1 }, note);
+    const dealerLine = '\n"You’re playing bold today, aren’t you?" — Dealer';
     const embed = new EmbedBuilder()
         .setColor('#2b2d31')
-        .setTitle('🃏 Blackjack — Dealer')
-        .setDescription(buildBJDescription(state, { player: state.player.length, dealer: 1 }, note))
+        .setTitle('')
+        .setDescription(`${header}\n\n${body}${dealerLine}\n\n💎 VIP Exclusive — Wins broadcast in #casino`)
         .setFooter({ text: `Bet: ${state.bet}` });
     await sendOrUpdate(interaction, { embeds: [embed] });
 }
@@ -671,11 +679,31 @@ client.on('interactionCreate', async (interaction) => {
             await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'roulette_bet', { bet: amount, betType, number });
             setCooldown('roulette:' + interaction.user.id);
 
-            // Roulette spin animation via edits
-            const frames = ['Spinning the wheel.','Spinning the wheel..','Spinning the wheel...','Spinning the wheel....'];
-            await interaction.reply({ content: `🎡 ${frames[0]}` });
-            for (let i = 1; i < frames.length; i++) { await new Promise(r => setTimeout(r, 400)); await interaction.editReply({ content: `🎡 ${frames[i]}` }); }
-            await new Promise(r => setTimeout(r, 600));
+            // Immersive roulette ASCII wheel
+            const wheelSpinning = `
+╔══════════════════════════════════════╗
+║        🎰 PREMIUM ROULETTE 🎰        ║
+║                                      ║
+║     ⚡ SPINNING AT LIGHT SPEED ⚡     ║
+║           💫 ∞ ∞ ∞ ∞ ∞ 💫           ║
+║        🌟 FORTUNE AWAITS 🌟         ║
+║                                      ║
+║   💎 VIP EXCLUSIVE - HIGH STAKES 💎  ║
+╚══════════════════════════════════════╝`;
+            const wheelSlowing = `
+╔══════════════════════════════════════╗
+║        🎰 PREMIUM ROULETTE 🎰        ║
+║                                      ║
+║         🎯 SLOWING DOWN... 🎯        ║
+║           🔥 7 14 23 31 🔥           ║
+║        ⭐ DESTINY DECIDES ⭐         ║
+║                                      ║
+║   💎 VIP EXCLUSIVE - HIGH STAKES 💎  ║
+╚══════════════════════════════════════╝`;
+            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
+            await new Promise(r => setTimeout(r, 900));
+            await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSlowing).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
+            await new Promise(r => setTimeout(r, 1100));
             const result = randomInt(0, 36);
             const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
             const color = result === 0 ? 'green' : (redSet.has(result) ? 'red' : 'black');
@@ -685,12 +713,21 @@ client.on('interactionCreate', async (interaction) => {
             else if (betType === 'low' || betType === 'high') { if (result !== 0 && ((betType==='low' && result<=18) || (betType==='high' && result>=19))) win = amount * 2; }
             else if (betType === 'number' && Number.isInteger(number) && number >= 0 && number <= 36) { if (result === number) win = amount * 35; }
 
+            const wheelResult = `
+╔══════════════════════════════════════╗
+║        🎰 PREMIUM ROULETTE 🎰        ║
+║                                      ║
+║           🏆 RESULT: ${result.toString().padStart(2,' ')} 🏆           ║
+║                ${color==='red' ? '🔴' : color==='black' ? '⚫' : '🟢'}                ║
+║                                      ║
+║     ${win>0 ? '💰 WINNER! 💰' : '😤 BETTER LUCK NEXT TIME'}      ║
+║                                      ║
+║   💎 ONLY IN OUR VIP CASINO 💎      ║
+╚══════════════════════════════════════╝`;
             const embed = new EmbedBuilder()
                 .setColor(win > 0 ? '#00c853' : '#c62828')
-                .setTitle('🎡 Roulette')
-                .setDescription(`Result: ${result} ${color === 'red' ? '🔴' : color === 'black' ? '⚫' : '🟢'}\n` +
-                                (win > 0 ? `You won ${win - amount} (payout ${win})!` : `You lost ${amount}.`))
-                .setFooter({ text: `Bet: ${amount}` });
+                .setDescription(wheelResult)
+                .setFooter({ text: `Bet: ${amount} • VIP rewards available` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (win > 0) {
                 await changeUserBalance(interaction.user.id, interaction.user.username, win, 'roulette_payout', { result });
@@ -726,17 +763,35 @@ client.on('interactionCreate', async (interaction) => {
                 return [roll(), roll(), roll()];
             }
 
-            // Slots animation
-            await interaction.reply({ content: '🎰 Spinning…' });
+            // Slots immersive frames
+            const frameBase = (line) => `
+╔══════════════════════════════════════╗
+║         💎 DIAMOND SLOT™ 💎          ║
+║       VIP-ONLY — HIGH LIMITS         ║
+║--------------------------------------║
+║           ${line}           ║
+║--------------------------------------║
+║  🎉 Exclusive jackpots in this server only! 🎉  ║
+╚══════════════════════════════════════╝`;
+            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription(frameBase('🌀 🌀 🌀')).setFooter({ text: '🎰 Spinning…' }) ] });
             await new Promise(r => setTimeout(r, 500));
-            await interaction.editReply({ content: '🎰 Reels stopping…' });
+            await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription(frameBase('🍒 🌀 🌀')).setFooter({ text: '🎰 Reels stopping…' }) ] });
             await new Promise(r => setTimeout(r, 500));
             const [a,b,c] = spin();
             let payout = 0;
             if (a === b && b === c) payout = amount * 10;
             else if (a === b || b === c || a === c) payout = amount * 2;
-            const desc = `Result: ${a} | ${b} | ${c}\n` + (payout > 0 ? `You won ${payout - amount} (payout ${payout})!` : `You lost ${amount}.`);
-            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setTitle('🎰 Slots').setDescription(desc).setFooter({ text: `Bet: ${amount}` });
+            const line = `${a} ${b} ${c}`;
+            const resultBox = `
+╔══════════════════════════════════════╗
+║         💎 DIAMOND SLOT™ 💎          ║
+║       VIP-ONLY — HIGH LIMITS         ║
+║--------------------------------------║
+║           ${line}           ║
+║--------------------------------------║
+║ ${payout>0 ? '💰 JACKPOT! CLAIM YOUR VIP REWARDS 💰' : '😤 MISS! TRY THE VIP LUCK AGAIN'} ║
+╚══════════════════════════════════════╝`;
+            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox).setFooter({ text: `Bet: ${amount}` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
 
