@@ -263,16 +263,73 @@ function handValue(cards) {
     return total;
 }
 function handEmoji(cards) { return cards.map(c => `🃏${c}`).join(' '); }
+function hidden(n) { return Array.from({ length: n }, () => '🂠').join(' '); }
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function updateBlackjackMessage(interaction, state, note) {
-    const playerVal = handValue(state.player);
-    const dealerVal = handValue([state.dealer[0]]);
+async function sendOrUpdate(interaction, payload) {
+    if (interaction.isButton && interaction.isButton()) {
+        return interaction.update(payload).catch(() => {});
+    }
+    return interaction.editReply(payload).catch(() => {});
+}
+
+function buildBJDescription(state, reveal, note) {
+    const pr = Math.min(reveal?.player ?? state.player.length, state.player.length);
+    const dr = Math.min(reveal?.dealer ?? 1, state.dealer.length);
+    const playerShown = pr > 0 ? handEmoji(state.player.slice(0, pr)) : '';
+    const playerHidden = pr < state.player.length ? (' ' + hidden(state.player.length - pr)) : '';
+    const dealerShown = dr > 0 ? handEmoji(state.dealer.slice(0, dr)) : '';
+    const dealerHidden = dr < state.dealer.length ? (' ' + hidden(state.dealer.length - dr)) : '';
+    const pv = handValue(state.player.slice(0, pr));
+    const dv = handValue(state.dealer.slice(0, Math.max(1, dr)));
+    const lines = [];
+    lines.push(`Dealer: ${dealerShown}${dealerHidden} (total: ${dr >= state.dealer.length ? handValue(state.dealer) : dv}?)`);
+    lines.push(`You: ${playerShown}${playerHidden} (total: ${pr >= state.player.length ? handValue(state.player) : pv}?)`);
+    if (note) lines.push(note);
+    return lines.join('\n');
+}
+
+async function animateBlackjackDeal(interaction, state) {
+    // Shuffling animation
+    for (const dots of ['Shuffling.','Shuffling..','Shuffling...']) {
+        const embed = new EmbedBuilder()
+            .setColor('#2b2d31')
+            .setTitle('🃏 Blackjack — Dealer')
+            .setDescription(`${dots}`)
+            .setFooter({ text: `Bet: ${state.bet}` });
+        await sendOrUpdate(interaction, { embeds: [embed] });
+        await delay(300);
+    }
+    // Reveal sequence: player first card, then second, dealer upcard
+    for (const step of [ { p: 1, d: 1 }, { p: 2, d: 1 } ]) {
+        const embed = new EmbedBuilder()
+            .setColor('#2b2d31')
+            .setTitle('🃏 Blackjack — Dealer')
+            .setDescription(buildBJDescription(state, { player: step.p, dealer: step.d }, 'Dealing...'))
+            .setFooter({ text: `Bet: ${state.bet}` });
+        await sendOrUpdate(interaction, { embeds: [embed] });
+        await delay(350);
+    }
+}
+
+async function animateBlackjackHit(interaction, state) {
     const embed = new EmbedBuilder()
         .setColor('#2b2d31')
         .setTitle('🃏 Blackjack — Dealer')
-        .setDescription(`Dealer: ${handEmoji([state.dealer[0]])} 🂠 (total: ${dealerVal}?)\nYou: ${handEmoji(state.player)} (total: ${playerVal})\n\n${note || ''}`)
+        .setDescription(buildBJDescription(state, { player: state.player.length - 1, dealer: 1 }, 'Drawing a card…'))
         .setFooter({ text: `Bet: ${state.bet}` });
-    await interaction.editReply({ embeds: [embed] });
+    await sendOrUpdate(interaction, { embeds: [embed] });
+    await delay(300);
+    await updateBlackjackMessage(interaction, state, 'You hit.');
+}
+
+async function updateBlackjackMessage(interaction, state, note) {
+    const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('🃏 Blackjack — Dealer')
+        .setDescription(buildBJDescription(state, { player: state.player.length, dealer: 1 }, note))
+        .setFooter({ text: `Bet: ${state.bet}` });
+    await sendOrUpdate(interaction, { embeds: [embed] });
 }
 
 async function resolveBlackjack(interaction, state, action, fromTimeout = false) {
@@ -310,7 +367,7 @@ async function resolveBlackjack(interaction, state, action, fromTimeout = false)
         .setTitle('🃏 Blackjack — Result')
         .setDescription(descLines.join('\n'))
         .setFooter({ text: `Bet: ${state.bet}` });
-    await interaction.editReply({ embeds: [embed], components: [] });
+    await sendOrUpdate(interaction, { embeds: [embed], components: [] });
 
     if (payout > 0) {
         await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
@@ -432,7 +489,8 @@ client.on('interactionCreate', async (interaction) => {
         try {
             const id = interaction.customId || '';
             if (!id.startsWith('bj_')) return;
-            const [, action, ownerId] = id.split(':');
+            const [prefix, ownerId] = id.split(':');
+            const action = prefix.replace('bj_', '');
             if (interaction.user.id !== ownerId) {
                 await interaction.reply({ content: 'This is not your game.', ephemeral: true });
                 return;
@@ -613,8 +671,11 @@ client.on('interactionCreate', async (interaction) => {
             await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'roulette_bet', { bet: amount, betType, number });
             setCooldown('roulette:' + interaction.user.id);
 
-            await interaction.reply({ content: `🎡 Spinning the wheel...`, ephemeral: false });
-            await new Promise(r => setTimeout(r, 1200));
+            // Roulette spin animation via edits
+            const frames = ['Spinning the wheel.','Spinning the wheel..','Spinning the wheel...','Spinning the wheel....'];
+            await interaction.reply({ content: `🎡 ${frames[0]}` });
+            for (let i = 1; i < frames.length; i++) { await new Promise(r => setTimeout(r, 400)); await interaction.editReply({ content: `🎡 ${frames[i]}` }); }
+            await new Promise(r => setTimeout(r, 600));
             const result = randomInt(0, 36);
             const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
             const color = result === 0 ? 'green' : (redSet.has(result) ? 'red' : 'black');
@@ -665,8 +726,11 @@ client.on('interactionCreate', async (interaction) => {
                 return [roll(), roll(), roll()];
             }
 
+            // Slots animation
             await interaction.reply({ content: '🎰 Spinning…' });
-            await new Promise(r => setTimeout(r, 700));
+            await new Promise(r => setTimeout(r, 500));
+            await interaction.editReply({ content: '🎰 Reels stopping…' });
+            await new Promise(r => setTimeout(r, 500));
             const [a,b,c] = spin();
             let payout = 0;
             if (a === b && b === c) payout = amount * 10;
