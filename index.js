@@ -325,17 +325,22 @@ async function animateBlackjackHit(interaction, state) {
 
 async function updateBlackjackMessage(interaction, state, note) {
     const header = [
-        '╔══════════════════════════════════════╗',
-        '║        🃏 HIGH-STAKES BLACKJACK 🃏     ║',
-        '║      💎 VIP TABLE — HOUSE EDGE 0.5%   ║',
-        '╚══════════════════════════════════════╝'
+        '╔════════════════════════════════════════════════╗',
+        '║           🃏 HIGH‑STAKES BLACKJACK TABLE 🃏       ║',
+        '║         💎 VIP EXCLUSIVE • ZERO FLUFF 💎         ║',
+        '╚════════════════════════════════════════════════╝'
     ].join('\n');
     const body = buildBJDescription(state, { player: state.player.length, dealer: 1 }, note);
-    const dealerLine = '\n"You’re playing bold today, aren’t you?" — Dealer';
+    const dealerLine = '\n"You’re playing bold today, aren’t you?" — Dealer 😼';
+    const table = [
+        '┌──────────────────────────────────────────────┐',
+        `│ ${body.replace(/\n/g, '\n│ ')}`,
+        '└──────────────────────────────────────────────┘'
+    ].join('\n');
     const embed = new EmbedBuilder()
         .setColor('#2b2d31')
         .setTitle('')
-        .setDescription(`${header}\n\n${body}${dealerLine}\n\n💎 VIP Exclusive — Wins broadcast in #casino`)
+        .setDescription(`${header}\n\n${table}${dealerLine}\n\n💎 VIP Rewards active • Play only in this server`)
         .setFooter({ text: `Bet: ${state.bet}` });
     await sendOrUpdate(interaction, { embeds: [embed] });
 }
@@ -700,10 +705,27 @@ client.on('interactionCreate', async (interaction) => {
 ║                                      ║
 ║   💎 VIP EXCLUSIVE - HIGH STAKES 💎  ║
 ╚══════════════════════════════════════╝`;
+            // Moving wheel frames with pointer → slows down
+            const ring = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];
+            const pointer = '▼';
             await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
-            await new Promise(r => setTimeout(r, 900));
-            await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSlowing).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
-            await new Promise(r => setTimeout(r, 1100));
+            let idx = randomInt(0, ring.length-1);
+            for (let speed of [80,80,100,120,140,160,200,250,300]) {
+                idx = (idx + 1) % ring.length;
+                const windowNums = [ring[(idx+ring.length-1)%ring.length], ring[idx], ring[(idx+1)%ring.length]];
+                const strip = windowNums.map((n,i)=> i===1?`[${n.toString().padStart(2,' ')}]` : ` ${n.toString().padStart(2,' ')} `).join(' ');
+                const frame = `
+╔══════════════════════════════════════╗
+║        🎰 PREMIUM ROULETTE 🎰        ║
+║                                      ║
+║            ${pointer}                   ║
+║        ${strip}        ║
+║                                      ║
+║       🌟 SPINNING THE WHEEL 🌟        ║
+╚══════════════════════════════════════╝`;
+                await new Promise(r => setTimeout(r, speed));
+                await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(frame).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
+            }
             const result = randomInt(0, 36);
             const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
             const color = result === 0 ? 'green' : (redSet.has(result) ? 'red' : 'black');
