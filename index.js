@@ -285,15 +285,14 @@ function handEmoji(cards) { return cards.map(c => `🃏${c}`).join(' '); }
 function hidden(n) { return Array.from({ length: n }, () => '🂠').join(' '); }
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function sendOrUpdate(interaction, payload) {
-    if (interaction.isButton && interaction.isButton()) {
-        // For button interactions, update the message response atomically
-        if (!interaction.deferred && !interaction.replied) {
-            return interaction.update(payload).catch(() => {});
-        }
-        return interaction.editReply(payload).catch(() => {});
-    }
-    return interaction.editReply(payload).catch(() => {});
+async function editGameMessage(state, payload) {
+    try {
+        const channel = await client.channels.fetch(state.channelId).catch(() => null);
+        if (!channel || !channel.isTextBased || !channel.isTextBased()) return;
+        const msg = await channel.messages.fetch(state.messageId).catch(() => null);
+        if (!msg) return;
+        await msg.edit(payload).catch(() => {});
+    } catch {}
 }
 
 function buildBJDescription(state, reveal, note) {
@@ -343,7 +342,7 @@ async function animateBlackjackDeal(interaction, state) {
             .setTitle('🃏 Blackjack — Dealer')
             .setDescription(`${dots}`)
             .setFooter({ text: `Bet: ${state.bet}` });
-        await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
+        await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
         await delay(300);
     }
     // Reveal sequence: player first card, then second, dealer upcard
@@ -353,7 +352,7 @@ async function animateBlackjackDeal(interaction, state) {
             .setTitle('🃏 Blackjack — Dealer')
             .setDescription(buildBJDescription(state, { player: step.p, dealer: step.d }, 'Dealing...'))
             .setFooter({ text: `Bet: ${state.bet}` });
-        await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
+        await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
         await delay(350);
     }
 }
@@ -364,7 +363,7 @@ async function animateBlackjackHit(interaction, state) {
         .setTitle('🃏 Blackjack — Dealer')
         .setDescription(buildBJDescription(state, { player: state.player.length - 1, dealer: 1 }, 'Drawing a card…'))
         .setFooter({ text: `Bet: ${state.bet}` });
-    await sendOrUpdate(interaction, { embeds: [embed] });
+    await editGameMessage(state, { embeds: [embed] });
     await delay(300);
     await updateBlackjackMessage(interaction, state, 'You hit.');
 }
@@ -394,7 +393,7 @@ async function updateBlackjackMessage(interaction, state, note) {
         .setTitle('')
         .setDescription(`${header}\n\n${table}${dealerQuip}\n\n💎 VIP Rewards active • Play only in this server`)
         .setFooter({ text: `Bet: ${state.bet}` });
-    await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
+    await editGameMessage(state, { embeds: [embed], components: buildBJComponents(state) });
 }
 
 async function resolveBlackjack(interaction, state, action, fromTimeout = false) {
@@ -434,7 +433,7 @@ async function resolveBlackjack(interaction, state, action, fromTimeout = false)
         .setTitle('🃏 Blackjack — Result')
         .setDescription(descLines.join('\n') + breakdown)
         .setFooter({ text: `Bet: ${state.bet}` });
-    await sendOrUpdate(interaction, { embeds: [embed], components: [] });
+    await editGameMessage(state, { embeds: [embed], components: [] });
 
     if (payout > 0) {
         await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
@@ -563,13 +562,14 @@ client.on('interactionCreate', async (interaction) => {
             if (!id.startsWith('bj_')) return;
             const [prefix, ownerId] = id.split(':');
             const action = prefix.replace('bj_', '');
-            if (interaction.user.id !== ownerId) {
-                await interaction.reply({ content: 'This is not your game.', ephemeral: true });
-                return;
+            // Always acknowledge immediately to avoid interaction failure
+            if (!interaction.deferred && !interaction.replied) {
+                await interaction.deferUpdate().catch(async () => { try { await interaction.reply({ content: 'Working…', ephemeral: true }); } catch {} });
             }
+            if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
             const state = activeBlackjack.get(ownerId);
-            if (!state) { await interaction.reply({ content: 'No active game found.', ephemeral: true }); return; }
-            if (state.ended) { await interaction.reply({ content: 'Game already finished.', ephemeral: true }); return; }
+            if (!state) { try { await interaction.followUp({ content: 'No active game found.', ephemeral: true }); } catch {} return; }
+            if (state.ended) { try { await interaction.followUp({ content: 'Game already finished.', ephemeral: true }); } catch {} return; }
             if (action === 'hit') {
                 try {
                     state.player.push(state.deck.pop());
@@ -589,7 +589,7 @@ client.on('interactionCreate', async (interaction) => {
                 // Deduct additional bet if possible
                 const bal = await getUserBalance(ownerId);
                 if (bal < state.bet) {
-                    await interaction.reply({ content: 'Not enough points to double.', ephemeral: true });
+                    try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {}
                     return;
                 }
                 await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_double_bet', { bet: state.bet });
@@ -601,7 +601,7 @@ client.on('interactionCreate', async (interaction) => {
             }
         } catch (e) {
             console.error('Blackjack button error:', e);
-            try { await interaction.reply({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
+            try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
         }
         return;
     }
@@ -695,7 +695,7 @@ client.on('interactionCreate', async (interaction) => {
             const deck = newDeck();
             const player = [deck.pop(), deck.pop()];
             const dealer = [deck.pop(), deck.pop()];
-            const state = { userId: interaction.user.id, bet, deck, player, dealer, startedAt: Date.now(), ended: false };
+            const state = { userId: interaction.user.id, bet, deck, player, dealer, startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null };
             activeBlackjack.set(interaction.user.id, state);
 
             const embed = new EmbedBuilder()
@@ -714,7 +714,18 @@ client.on('interactionCreate', async (interaction) => {
                     ]
                 }
             ];
-            await interaction.reply({ embeds: [embed], components });
+            // Send the initial message and record its id for future safe edits
+            const sent = await interaction.reply({ embeds: [embed], components, fetchReply: true }).catch(() => null);
+            if (sent && sent.id) { state.messageId = sent.id; }
+            if (!state.messageId) {
+                // Fallback: fetch last message from channel by bot
+                try {
+                    const channel = await client.channels.fetch(interaction.channelId);
+                    const recent = await channel.messages.fetch({ limit: 1 });
+                    const last = recent.first();
+                    if (last) state.messageId = last.id;
+                } catch {}
+            }
 
             // Apply immersive dealing animation and large table right away
             await animateBlackjackDeal(interaction, state);
