@@ -22,6 +22,18 @@ try {
 } catch (e) {
     console.error('Failed to ensure database directory exists:', e);
 }
+
+// Migrate legacy DB from project root to /data if present and destination missing
+try {
+    const legacyPath = path.resolve('./vouch_points.db');
+    if (!fs.existsSync(dbPath) && fs.existsSync(legacyPath)) {
+        fs.copyFileSync(legacyPath, dbPath);
+        console.log('➡️  Migrated legacy database to', dbPath);
+    }
+} catch (e) {
+    console.error('Database migration error:', e);
+}
+
 const db = new sqlite3.Database(dbPath);
 
 // Create tables for storing vouch points and settings
@@ -489,6 +501,31 @@ client.on('interactionCreate', async (interaction) => {
         await setMultiplier(1);
         interaction.reply({ content: '✅ Multiplier reset to 1x.' });
     }
+
+    if (interaction.commandName === 'wipevouches') {
+        if (!interaction.inGuild()) {
+            interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+            return;
+        }
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        if (!isAdmin) {
+            interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+            return;
+        }
+        const confirm = interaction.options.getString?.('confirm') || '';
+        if (confirm.toLowerCase() !== 'yes') {
+            interaction.reply({ content: 'Type /wipevouches confirm:yes to wipe all vouch points (irreversible).', ephemeral: true });
+            return;
+        }
+        db.run('DELETE FROM vouch_points', (err) => {
+            if (err) {
+                console.error('Database error wiping vouches:', err);
+                interaction.reply({ content: '❌ Error wiping vouch points.', ephemeral: true });
+                return;
+            }
+            interaction.reply({ content: '🧹 All vouch points have been wiped.' });
+        });
+    }
     if (interaction.commandName === 'vouchleaderboard' || interaction.commandName === 'leaderboard') {
         db.all('SELECT user_id, points FROM vouch_points ORDER BY points DESC LIMIT 10', [], (err, rows) => {
             if (err) {
@@ -577,7 +614,14 @@ client.once('ready', async () => {
             ]
         },
         { name: 'multiplierstatus', description: 'Show current vouch multiplier' },
-        { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false }
+        { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false },
+        {
+            name: 'wipevouches',
+            description: 'Admin: Wipe all vouch points (irreversible)',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [ { name: 'confirm', description: 'Type "yes" to confirm', type: 3, required: true } ]
+        }
     ];
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
