@@ -85,10 +85,59 @@ async function setMultiplier(value) {
     return val;
 }
 
+// Multiplier expiry scheduling and announcements
+let multiplierExpiryTimeout = null;
+
+async function getMultiplierExpiryMs() {
+    const raw = await getSetting('multiplier_expires_at', '0');
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+}
+
+async function setMultiplierExpiryMs(ms) {
+    await setSetting('multiplier_expires_at', String(ms || 0));
+}
+
+async function scheduleMultiplierExpiryIfNeeded(client) {
+    if (multiplierExpiryTimeout) {
+        clearTimeout(multiplierExpiryTimeout);
+        multiplierExpiryTimeout = null;
+    }
+    const expiresAt = await getMultiplierExpiryMs();
+    const now = Date.now();
+    if (!expiresAt || expiresAt <= now) {
+        // If expired, ensure multiplier is 1
+        if ((await getMultiplier()) !== 1) {
+            await setMultiplier(1);
+        }
+        return;
+    }
+    const delay = Math.max(0, expiresAt - now);
+    multiplierExpiryTimeout = setTimeout(async () => {
+        try {
+            await setMultiplier(1);
+            await setMultiplierExpiryMs(0);
+            const channelId = await getSetting('multiplier_announce_channel_id', '');
+            if (channelId) {
+                const channel = await client.channels.fetch(channelId).catch(() => null);
+                if (channel && channel.isTextBased && channel.isTextBased()) {
+                    channel.send({
+                        content: '@everyone Vouch multiplier has ended. Back to 1x.',
+                        allowedMentions: { parse: ['everyone'] }
+                    }).catch(() => {});
+                }
+            }
+        } catch (e) {
+            console.error('Error ending multiplier:', e);
+        }
+    }, delay);
+}
+
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
     await setMultiplier(await getMultiplier());
+    await scheduleMultiplierExpiryIfNeeded(client);
 });
 
 // Message event handler
@@ -394,9 +443,32 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
         const value = interaction.options.getNumber('value');
+        const durationMinutes = interaction.options.getInteger?.('duration_minutes') || 0;
         const newVal = Math.max(1, Math.floor(value || 1));
         await setMultiplier(newVal);
-        interaction.reply({ content: `✅ Multiplier set to ${newVal}x.` });
+
+        // Announce in the channel where command executed
+        const announceContent = durationMinutes > 0
+            ? `@everyone Vouch multiplier is now ${newVal}x for ${durationMinutes} minute(s)!`
+            : `@everyone Vouch multiplier is now ${newVal}x until further notice!`;
+
+        // Save announcement channel id for end-of-multiplier message
+        await setSetting('multiplier_announce_channel_id', interaction.channelId);
+
+        await interaction.reply({
+            content: announceContent,
+            allowedMentions: { parse: ['everyone'] }
+        });
+
+        // Schedule expiry if duration provided
+        if (durationMinutes > 0) {
+            const expiresAt = Date.now() + durationMinutes * 60 * 1000;
+            await setMultiplierExpiryMs(expiresAt);
+            await scheduleMultiplierExpiryIfNeeded(interaction.client);
+        } else {
+            await setMultiplierExpiryMs(0);
+            await scheduleMultiplierExpiryIfNeeded(interaction.client);
+        }
     }
 
     if (interaction.commandName === 'multiplierstatus') {
@@ -499,7 +571,10 @@ client.once('ready', async () => {
             description: 'Admin: Set global vouch multiplier (e.g., 2 for 2x)',
             default_member_permissions: PermissionFlagsBits.Administrator.toString(),
             dm_permission: false,
-            options: [ { name: 'value', description: 'Multiplier value (>=1)', type: 10, required: true } ]
+            options: [
+                { name: 'value', description: 'Multiplier value (>=1)', type: 10, required: true },
+                { name: 'duration_minutes', description: 'Duration in minutes (optional)', type: 4, required: false }
+            ]
         },
         { name: 'multiplierstatus', description: 'Show current vouch multiplier' },
         { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false }
