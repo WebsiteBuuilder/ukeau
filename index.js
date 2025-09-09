@@ -295,6 +295,24 @@ async function editGameMessage(state, payload) {
     } catch {}
 }
 
+async function updateGame(interaction, state, payload) {
+    // Try the most direct edit method available, then fall back
+    try {
+        if (interaction && interaction.isButton && interaction.isButton()) {
+            if (interaction.message && interaction.message.edit) {
+                await interaction.message.edit(payload);
+                return;
+            }
+            // As a fallback for buttons, try update (safe after deferUpdate)
+            try { await interaction.update(payload); return; } catch {}
+        } else if (interaction && interaction.editReply) {
+            try { await interaction.editReply(payload); return; } catch {}
+        }
+    } catch {}
+    // Final fallback: edit by channel/message id
+    await editGameMessage(state, payload);
+}
+
 // =============== NEW BLACKJACK (Player-friendly) ===============
 function bjCreateShoe(numDecks = 4) {
     const deck = [];
@@ -360,9 +378,9 @@ function bjComponents(state) {
     return [{ type: 1, components: comps }];
 }
 
-async function bjUpdateView(state, opts = {}) {
+async function bjUpdateView(state, opts = {}, interaction = null) {
     const embed = bjBuildEmbed(state, opts);
-    await editGameMessage(state, { embeds: [embed], components: bjComponents(state) });
+    await updateGame(interaction, state, { embeds: [embed], components: bjComponents(state) });
 }
 
 function bjApplyDealerInitialFairness(state) {
@@ -425,7 +443,7 @@ async function bjResolve(interaction, state, action, fromTimeout = false) {
                       outcome === 'surrender' ? `You surrendered. Refunded ${payout}.` :
                       `You lost ${state.bet}.`;
     const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
-    await editGameMessage(state, { embeds: [embed], components: [] });
+    await updateGame(interaction, state, { embeds: [embed], components: [] });
 
     if (payout > 0) {
         await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'blackjack_payout', { outcome, pv, dv });
@@ -580,7 +598,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (pv >= 21) {
                     await bjResolve(interaction, state, 'stand');
                 } else {
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\nYou hit.' });
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\nYou hit.' }, interaction);
                 }
             } else if (action === 'stand') {
                 await bjResolve(interaction, state, 'stand');
@@ -693,11 +711,7 @@ client.on('interactionCreate', async (interaction) => {
             bjGames.set(interaction.user.id, state);
             await bjDealInitial(state);
 
-            const embed = new EmbedBuilder()
-                .setColor('#2b2d31')
-                .setTitle('🃏 Blackjack — Dealer')
-                .setDescription('Preparing the table…')
-                .setFooter({ text: `Bet: ${bet}` });
+            const initialEmbed = bjBuildEmbed(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' });
             const components = [
                 {
                     type: 1,
@@ -710,7 +724,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
             ];
             // Send the initial message and record its id for future safe edits
-            const sent = await interaction.reply({ embeds: [embed], components, fetchReply: true }).catch(() => null);
+            const sent = await interaction.reply({ embeds: [initialEmbed], components, fetchReply: true }).catch(() => null);
             if (sent && sent.id) { state.messageId = sent.id; }
             if (!state.messageId) {
                 // Fallback: fetch last message from channel by bot
@@ -721,8 +735,8 @@ client.on('interactionCreate', async (interaction) => {
                     if (last) state.messageId = last.id;
                 } catch {}
             }
-            // Show initial view
-            await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' });
+            // Ensure initial view drew; also try a second update via editReply to avoid any race
+            await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' }, interaction);
 
             // Auto-timeout to stand after 30s
             setTimeout(async () => {
