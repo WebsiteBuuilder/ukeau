@@ -287,7 +287,10 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendOrUpdate(interaction, payload) {
     if (interaction.isButton && interaction.isButton()) {
-        // Prefer editing the existing message after deferring update
+        // For button interactions, update the message response atomically
+        if (!interaction.deferred && !interaction.replied) {
+            return interaction.update(payload).catch(() => {});
+        }
         return interaction.editReply(payload).catch(() => {});
     }
     return interaction.editReply(payload).catch(() => {});
@@ -309,6 +312,29 @@ function buildBJDescription(state, reveal, note) {
     return lines.join('\n');
 }
 
+function normalizeRank(c) { return c; }
+function canSplit(state) {
+    if (state.split) return false;
+    if (!state.player || state.player.length !== 2) return false;
+    return normalizeRank(state.player[0]) === normalizeRank(state.player[1]);
+}
+
+function buildBJComponents(state) {
+    const components = [];
+    const base = [];
+    base.push({ type: 2, style: 1, label: 'Hit', custom_id: `bj_hit:${state.userId}` });
+    base.push({ type: 2, style: 2, label: 'Stand', custom_id: `bj_stand:${state.userId}` });
+    if (!state.split) {
+        base.push({ type: 2, style: 3, label: 'Double', custom_id: `bj_double:${state.userId}` });
+        if (canSplit(state)) {
+            base.push({ type: 2, style: 1, label: 'Split', custom_id: `bj_split:${state.userId}` });
+        }
+        base.push({ type: 2, style: 4, label: 'Surrender', custom_id: `bj_surrender:${state.userId}` });
+    }
+    components.push({ type: 1, components: base });
+    return components;
+}
+
 async function animateBlackjackDeal(interaction, state) {
     // Shuffling animation
     for (const dots of ['Shuffling.','Shuffling..','Shuffling...']) {
@@ -317,7 +343,7 @@ async function animateBlackjackDeal(interaction, state) {
             .setTitle('🃏 Blackjack — Dealer')
             .setDescription(`${dots}`)
             .setFooter({ text: `Bet: ${state.bet}` });
-        await sendOrUpdate(interaction, { embeds: [embed] });
+        await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
         await delay(300);
     }
     // Reveal sequence: player first card, then second, dealer upcard
@@ -327,7 +353,7 @@ async function animateBlackjackDeal(interaction, state) {
             .setTitle('🃏 Blackjack — Dealer')
             .setDescription(buildBJDescription(state, { player: step.p, dealer: step.d }, 'Dealing...'))
             .setFooter({ text: `Bet: ${state.bet}` });
-        await sendOrUpdate(interaction, { embeds: [embed] });
+        await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
         await delay(350);
     }
 }
@@ -368,7 +394,7 @@ async function updateBlackjackMessage(interaction, state, note) {
         .setTitle('')
         .setDescription(`${header}\n\n${table}${dealerQuip}\n\n💎 VIP Rewards active • Play only in this server`)
         .setFooter({ text: `Bet: ${state.bet}` });
-    await sendOrUpdate(interaction, { embeds: [embed] });
+    await sendOrUpdate(interaction, { embeds: [embed], components: buildBJComponents(state) });
 }
 
 async function resolveBlackjack(interaction, state, action, fromTimeout = false) {
