@@ -281,8 +281,8 @@ function handValue(cards) {
     while (total > 21 && aces > 0) { total -= 10; aces--; }
     return total;
 }
-function handEmoji(cards) { return cards.map(c => `🃏${c}`).join(' '); }
-function hidden(n) { return Array.from({ length: n }, () => '🂠').join(' '); }
+function handEmoji(cards) { return cards.map(c => `🃏${c}`).join('  '); }
+function hidden(n) { return Array.from({ length: n }, () => '🂠').join('  '); }
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function editGameMessage(state, payload) {
@@ -353,7 +353,7 @@ function bjBuildEmbed(state, opts = {}) {
     const hideDealerHole = !!opts.hideDealerHole;
     const dealerShown = hideDealerHole ? [state.dealer[0]] : state.dealer.slice();
     const dealerHiddenCount = hideDealerHole ? (state.dealer.length - 1) : 0;
-    const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
+    const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? ('  ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
     
     // Handle split hands with better visual indicators
@@ -365,8 +365,13 @@ function bjBuildEmbed(state, opts = {}) {
         const handTotal = handValue(hand);
         const activeIndicator = isCurrentHand ? '▶️ ' : '  ';
         const handStatus = handTotal > 21 ? '💥 BUST' : handTotal === 21 ? '🃏 BLACKJACK' : '';
-        return `║ ${activeIndicator}${handLabel}: ${handCards.padEnd(55,' ')}${handStatus.padEnd(15,' ')}║\n║     Total : ${String(handTotal).padEnd(60,' ')}║`;
-    }).join('\n╟────────────────────────────────────────────────────────────────────────────╢\n');
+        
+        // Make cards display larger and more prominent
+        const cardDisplay = `\n║ ${activeIndicator}${handLabel}: ${handCards}${handStatus ? `  ${handStatus}` : ''}║`;
+        const totalDisplay = `\n║     Total : ${String(handTotal).padEnd(20,' ')}║`;
+        
+        return cardDisplay + totalDisplay;
+    }).join('\n╟────────────────────────────────────────────────────────────────────────────╢');
 
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
@@ -374,8 +379,8 @@ function bjBuildEmbed(state, opts = {}) {
         '║                            💎 VIP CASINO EXPERIENCE 💎                        ║',
         '╠════════════════════════════════════════════════════════════════════════════════╣',
         '║                                                                                ║',
-        `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
-        `║ 🎯 TOTAL : ${dealerTotal.padEnd(65,' ')}║`,
+        `║ 🎯 DEALER: ${dealerLine}║`,
+        `║ 🎯 TOTAL : ${dealerTotal.padEnd(20,' ')}║`,
         '║                                                                                ║',
         '╟────────────────────────────────────────────────────────────────────────────╢',
         '║                                                                                ║',
