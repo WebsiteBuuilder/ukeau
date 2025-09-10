@@ -356,19 +356,22 @@ function bjBuildEmbed(state, opts = {}) {
     const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
     
-    // Handle split hands
+    // Handle split hands with better visual indicators
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
     const playerLines = playerHands.map((hand, idx) => {
+        const isCurrentHand = state.split && state.currentSplitHand === (idx + 1);
         const handLabel = state.split ? (idx === 0 ? 'Hand 1' : 'Hand 2') : 'Player';
         const handCards = handEmoji(hand);
         const handTotal = handValue(hand);
-        return `║ ${handLabel}: ${handCards.padEnd(60,' ')}║\n║ Total : ${String(handTotal).padEnd(60,' ')}║`;
+        const activeIndicator = isCurrentHand ? '▶️ ' : '  ';
+        const handStatus = handTotal > 21 ? '💥 BUST' : handTotal === 21 ? '🃏 BLACKJACK' : '';
+        return `║ ${activeIndicator}${handLabel}: ${handCards.padEnd(55,' ')}${handStatus.padEnd(15,' ')}║\n║     Total : ${String(handTotal).padEnd(60,' ')}║`;
     }).join('\n╟────────────────────────────────────────────────────────────────────────────╢\n');
 
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
-        '║                              🃏 PREMIUM BLACKJACK 🃏                           ║',
-        '║                              💎 VIP CASINO EXPERIENCE 💎                      ║',
+        '║                          🃏 PREMIUM BLACKJACK TABLE 🃏                        ║',
+        '║                            💎 VIP CASINO EXPERIENCE 💎                        ║',
         '╠════════════════════════════════════════════════════════════════════════════════╣',
         '║                                                                                ║',
         `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
@@ -382,11 +385,12 @@ function bjBuildEmbed(state, opts = {}) {
     ].join('\n');
 
     const note = opts.note ? `\n\n${opts.note}` : '';
+    const gameStatus = state.split ? `\n🎮 Playing ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'} of 2` : '';
     return new EmbedBuilder()
-        .setColor('#1a1a2e')
+        .setColor(state.split ? '#4a148c' : '#1a1a2e')
         .setTitle('🎰 HIGH STAKES BLACKJACK TABLE')
-        .setDescription(`${table}${note}`)
-        .setFooter({ text: `💰 Bet: ${state.bet} • 🎲 Fair Play Guaranteed • ⚡ Lightning Fast` });
+        .setDescription(`${table}${note}${gameStatus}`)
+        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 Fair Play Guaranteed • ⚡ Lightning Fast` });
 }
 
 function bjComponents(state) {
@@ -680,15 +684,29 @@ client.on('interactionCreate', async (interaction) => {
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
 
-            // Prefer new blackjack state if exists
+            // Get game state with better error handling
             let state = bjGames.get(ownerId);
             const isLegacyOnly = !state && isOldBJ;
             if (!state && isLegacyOnly) {
                 try { await interaction.followUp({ content: 'Game was reset to new version. Start a fresh /blackjack.', ephemeral: true }); } catch {}
                 return;
             }
-            if (!state) { try { await interaction.followUp({ content: 'No active game found.', ephemeral: true }); } catch {} return; }
-            if (state.ended) { try { await interaction.followUp({ content: 'Game already finished.', ephemeral: true }); } catch {} return; }
+            if (!state) { 
+                try { await interaction.followUp({ content: 'No active game found. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
+                return; 
+            }
+            if (state.ended) { 
+                try { await interaction.followUp({ content: 'Game already finished. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
+                return; 
+            }
+            
+            // Check if game is too old (5 minutes timeout)
+            const gameAge = Date.now() - state.startedAt;
+            if (gameAge > 5 * 60 * 1000) {
+                bjGames.delete(ownerId);
+                try { await interaction.followUp({ content: 'Game timed out after 5 minutes. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                return;
+            }
 
             if (action === 'hit') {
                 if (state.split) {
@@ -700,12 +718,12 @@ client.on('interactionCreate', async (interaction) => {
                         // Move to next hand or resolve
                         if (state.currentSplitHand === 1) {
                             state.currentSplitHand = 2;
-                            await bjUpdateView(state, { hideDealerHole: true, note: '\nHand 1 done. Playing Hand 2.' }, interaction);
+                            await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 Hand 1 complete! Now playing Hand 2.' }, interaction);
                         } else {
                             await bjResolve(interaction, state, 'stand');
                         }
                     } else {
-                        await bjUpdateView(state, { hideDealerHole: true, note: `\nYou hit ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'}.` }, interaction);
+                        await bjUpdateView(state, { hideDealerHole: true, note: `\n🎯 You hit ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'}.` }, interaction);
                     }
                 } else {
                     state.player.push(bjDraw(state));
@@ -713,14 +731,14 @@ client.on('interactionCreate', async (interaction) => {
                     if (pv >= 21) {
                         await bjResolve(interaction, state, 'stand');
                     } else {
-                        await bjUpdateView(state, { hideDealerHole: true, note: '\nYou hit.' }, interaction);
+                        await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
                     }
                 }
             } else if (action === 'stand') {
                 if (state.split && state.currentSplitHand === 1) {
                     // Move to second hand
                     state.currentSplitHand = 2;
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\nHand 1 stood. Playing Hand 2.' }, interaction);
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\n✋ Hand 1 stood. Now playing Hand 2.' }, interaction);
                 } else {
                     await bjResolve(interaction, state, 'stand');
                 }
@@ -734,22 +752,34 @@ client.on('interactionCreate', async (interaction) => {
                 state.player.push(bjDraw(state));
                 await bjResolve(interaction, state, 'stand');
             } else if (action === 'split') {
-                if (!bjCanSplit(state)) { try { await interaction.followUp({ content: 'Cannot split these cards.', ephemeral: true }); } catch {} return; }
+                if (!bjCanSplit(state)) { 
+                    try { await interaction.followUp({ content: 'Cannot split these cards. Cards must be the same rank (e.g., 8-8, J-Q, 10-K).', ephemeral: true }); } catch {} 
+                    return; 
+                }
                 const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to split.', ephemeral: true }); } catch {} return; }
-                await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
+                if (bal < state.bet) { 
+                    try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {} 
+                    return; 
+                }
                 
-                // Split the hand
-                state.split = true;
-                state.splitHand = [state.player[1]]; // Second card becomes split hand
-                state.player = [state.player[0]]; // First card stays in main hand
-                state.currentSplitHand = 1; // Start with first hand
-                
-                // Deal one card to each hand
-                state.player.push(bjDraw(state));
-                state.splitHand.push(bjDraw(state));
-                
-                await bjUpdateView(state, { hideDealerHole: true, note: '\nHands split! Playing Hand 1.' }, interaction);
+                try {
+                    await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
+                    
+                    // Split the hand
+                    state.split = true;
+                    state.splitHand = [state.player[1]]; // Second card becomes split hand
+                    state.player = [state.player[0]]; // First card stays in main hand
+                    state.currentSplitHand = 1; // Start with first hand
+                    
+                    // Deal one card to each hand
+                    state.player.push(bjDraw(state));
+                    state.splitHand.push(bjDraw(state));
+                    
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\n🎉 Hands split successfully! Playing Hand 1.' }, interaction);
+                } catch (error) {
+                    console.error('Split error:', error);
+                    try { await interaction.followUp({ content: 'Error processing split. Please try again.', ephemeral: true }); } catch {}
+                }
             } else if (action === 'surrender') {
                 await bjResolve(interaction, state, 'surrender');
             }
@@ -877,12 +907,12 @@ client.on('interactionCreate', async (interaction) => {
             // Ensure initial view drew; also try a second update via editReply to avoid any race
             await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' }, interaction);
 
-            // Auto-timeout to stand after 30s
+            // Auto-timeout to stand after 60s (increased from 30s)
             setTimeout(async () => {
                 const s = bjGames.get(interaction.user.id);
                 if (!s || s.ended) return;
                 await bjResolve(interaction, s, 'stand', true);
-            }, 30000);
+            }, 60000);
         } catch (e) {
             console.error('Blackjack start error:', e);
             // Refund if failed
