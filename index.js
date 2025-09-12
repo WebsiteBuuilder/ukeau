@@ -793,84 +793,86 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
 
-            if (action === 'hit') {
-                if (state.split) {
-                    // Handle split hand hitting - alternate between hands
-                    const currentHand = state.currentSplitHand === 1 ? state.player : state.splitHand;
-                    currentHand.push(bjDraw(state));
-                    const pv = handValue(currentHand);
-                    if (pv >= 21) {
-                        // Move to next hand or resolve
-                        if (state.currentSplitHand === 1) {
-                            state.currentSplitHand = 2;
-                            await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 Hand 1 complete! Now playing Hand 2.' }, interaction);
+            try {
+                if (action === 'hit') {
+                    if (state.split) {
+                        // Handle split hand hitting - alternate between hands
+                        const currentHand = state.currentSplitHand === 1 ? state.player : state.splitHand;
+                        currentHand.push(bjDraw(state));
+                        const pv = handValue(currentHand);
+                        if (pv >= 21) {
+                            // Move to next hand or resolve
+                            if (state.currentSplitHand === 1) {
+                                state.currentSplitHand = 2;
+                                await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 Hand 1 complete! Now playing Hand 2.' }, interaction);
+                            } else {
+                                await bjResolve(interaction, state, 'stand');
+                            }
                         } else {
-                            await bjResolve(interaction, state, 'stand');
+                            await bjUpdateView(state, { hideDealerHole: true, note: `\n🎯 You hit ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'}.` }, interaction);
                         }
                     } else {
-                        await bjUpdateView(state, { hideDealerHole: true, note: `\n🎯 You hit ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'}.` }, interaction);
+                        state.player.push(bjDraw(state));
+                        const pv = handValue(state.player);
+                        if (pv >= 21) {
+                            await bjResolve(interaction, state, 'stand');
+                        } else {
+                            await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
+                        }
                     }
-                } else {
-                    state.player.push(bjDraw(state));
-                    const pv = handValue(state.player);
-                    if (pv >= 21) {
-                        await bjResolve(interaction, state, 'stand');
+                } else if (action === 'stand') {
+                    if (state.split && state.currentSplitHand === 1) {
+                        // Move to second hand
+                        state.currentSplitHand = 2;
+                        await bjUpdateView(state, { hideDealerHole: true, note: '\n✋ Hand 1 stood. Now playing Hand 2.' }, interaction);
                     } else {
-                        await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
+                        await bjResolve(interaction, state, 'stand');
                     }
-                }
-            } else if (action === 'stand') {
-                if (state.split && state.currentSplitHand === 1) {
-                    // Move to second hand
-                    state.currentSplitHand = 2;
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\n✋ Hand 1 stood. Now playing Hand 2.' }, interaction);
-                } else {
-                    await bjResolve(interaction, state, 'stand');
-                }
-            } else if (action === 'double') {
-                if (!bjCanDouble(state)) { try { await interaction.followUp({ content: 'Cannot double now.', ephemeral: true }); } catch {} return; }
-                const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {} return; }
-                await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_double_bet', { bet: state.bet });
-                state.bet *= 2;
-                state.doubled = true;
-                state.player.push(bjDraw(state));
-                await bjResolve(interaction, state, 'stand');
-            } else if (action === 'split') {
-                if (!bjCanSplit(state)) { 
-                    try { await interaction.followUp({ content: 'Cannot split these cards. Cards must be the same rank (e.g., 8-8, J-Q, 10-K).', ephemeral: true }); } catch {} 
-                    return; 
-                }
-                const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) { 
-                    try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {} 
-                    return; 
-                }
-                
-                try {
-                    await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
-                    
-                    // Split the hand
-                    state.split = true;
-                    state.splitHand = [state.player[1]]; // Second card becomes split hand
-                    state.player = [state.player[0]]; // First card stays in main hand
-                    state.currentSplitHand = 1; // Start with first hand
-                    
-                    // Deal one card to each hand
+                } else if (action === 'double') {
+                    if (!bjCanDouble(state)) { try { await interaction.followUp({ content: 'Cannot double now.', ephemeral: true }); } catch {} return; }
+                    const bal = await getUserBalance(ownerId);
+                    if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {} return; }
+                    await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_double_bet', { bet: state.bet });
+                    state.bet *= 2;
+                    state.doubled = true;
                     state.player.push(bjDraw(state));
-                    state.splitHand.push(bjDraw(state));
-                    
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\n🎉 Hands split successfully! Playing Hand 1.' }, interaction);
-                } catch (error) {
-                    console.error('Split error:', error);
-                    try { await interaction.followUp({ content: 'Error processing split. Please try again.', ephemeral: true }); } catch {}
+                    await bjResolve(interaction, state, 'stand');
+                } else if (action === 'split') {
+                    if (!bjCanSplit(state)) {
+                        try { await interaction.followUp({ content: 'Cannot split these cards. Cards must be the same rank (e.g., 8-8, J-Q, 10-K).', ephemeral: true }); } catch {}
+                        return;
+                    }
+                    const bal = await getUserBalance(ownerId);
+                    if (bal < state.bet) {
+                        try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {}
+                        return;
+                    }
+
+                    try {
+                        await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
+
+                        // Split the hand
+                        state.split = true;
+                        state.splitHand = [state.player[1]]; // Second card becomes split hand
+                        state.player = [state.player[0]]; // First card stays in main hand
+                        state.currentSplitHand = 1; // Start with first hand
+
+                        // Deal one card to each hand
+                        state.player.push(bjDraw(state));
+                        state.splitHand.push(bjDraw(state));
+
+                        await bjUpdateView(state, { hideDealerHole: true, note: '\n🎉 Hands split successfully! Playing Hand 1.' }, interaction);
+                    } catch (error) {
+                        console.error('Split error:', error);
+                        try { await interaction.followUp({ content: 'Error processing split. Please try again.', ephemeral: true }); } catch {}
+                    }
+                } else if (action === 'surrender') {
+                    await bjResolve(interaction, state, 'surrender');
                 }
-            } else if (action === 'surrender') {
-                await bjResolve(interaction, state, 'surrender');
-        } catch (e) {
-            console.error('Blackjack button error:', e);
-            try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
-        }
+            } catch (e) {
+                console.error('Blackjack button error:', e);
+                try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
+            }
         return;
     }
 
