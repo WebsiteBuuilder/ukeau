@@ -724,18 +724,20 @@ client.once('ready', async () => {
         }
     }, 30 * 60 * 1000); // 30 minutes
 
-    // Set up game state cleanup (every 5 minutes)
+    // Set up game state cleanup (every 10 minutes - less aggressive)
     setInterval(() => {
         try {
             let cleaned = 0;
             const now = Date.now();
             for (const [userId, state] of bjGames.entries()) {
                 const gameAge = now - state.startedAt;
-                const maxAge = state.split ? 15 * 60 * 1000 : 8 * 60 * 1000; // 15min for splits, 8min for regular
+                const maxAge = state.split ? 20 * 60 * 1000 : 12 * 60 * 1000; // 20min for splits, 12min for regular
 
-                if (gameAge > maxAge || state.ended || !state.player || !Array.isArray(state.player)) {
+                // Only clean up if truly corrupted or very old
+                if ((gameAge > maxAge && !state.ended) || !state.player || !Array.isArray(state.player) || state.player.length === 0) {
                     bjGames.delete(userId);
                     cleaned++;
+                    console.log(`🧹 Cleaned up game for user ${userId} (age: ${Math.round(gameAge/60000)}min, ended: ${state.ended})`);
                 }
             }
             if (cleaned > 0) {
@@ -744,10 +746,10 @@ client.once('ready', async () => {
         } catch (error) {
             console.error('Game cleanup error:', error);
         }
-    }, 5 * 60 * 1000); // 5 minutes
+    }, 10 * 60 * 1000); // 10 minutes - less frequent
 
     console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
-    console.log('🧹 Game cleanup system initialized - runs every 5 minutes');
+    console.log('🧹 Game cleanup system initialized - runs every 10 minutes');
 
     // Register slash commands
     const commands = [
@@ -941,22 +943,35 @@ async function awardVouchPoint(message) {
     });
 }
 
+// Cache for 24-hour winner to prevent repeated database queries
+let winnerCache = { data: null, timestamp: 0 };
+const WINNER_CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
 // Function to get top casino winner from last 24 hours
 async function get24HourTopWinner() {
+    const now = Date.now();
+
+    // Return cached data if still fresh
+    if (winnerCache.data && (now - winnerCache.timestamp) < WINNER_CACHE_DURATION) {
+        return winnerCache.data;
+    }
+
     return new Promise((resolve, reject) => {
         // Get current time minus 24 hours
         const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
 
         // Query for net wins from casino games in last 24 hours
+        // Join with vouch_points table to get username
         db.get(`
             SELECT
-                user_id,
-                SUM(delta) as net_wins,
-                username
-            FROM ledger
-            WHERE reason LIKE 'blackjack_%' OR reason LIKE 'roulette_%' OR reason LIKE 'slots_%'
-            AND created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
-            GROUP BY user_id
+                l.user_id,
+                SUM(l.delta) as net_wins,
+                COALESCE(v.username, 'Unknown') as username
+            FROM ledger l
+            LEFT JOIN vouch_points v ON l.user_id = v.user_id
+            WHERE l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%'
+            AND l.created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+            GROUP BY l.user_id
             ORDER BY net_wins DESC
             LIMIT 1
         `, [], (err, row) => {
@@ -965,6 +980,11 @@ async function get24HourTopWinner() {
                 resolve(null);
                 return;
             }
+
+            // Update cache
+            winnerCache.data = row;
+            winnerCache.timestamp = now;
+
             resolve(row);
         });
     });
@@ -983,9 +1003,9 @@ function recoverGameState(userId) {
             return null;
         }
 
-        // Check if game is too old
+        // Check if game is too old (more lenient timeouts)
         const gameAge = Date.now() - state.startedAt;
-        if (gameAge > (state.split ? 15 * 60 * 1000 : 8 * 60 * 1000)) { // 15min for splits, 8min for regular
+        if (gameAge > (state.split ? 25 * 60 * 1000 : 15 * 60 * 1000)) { // 25min for splits, 15min for regular
             console.log('Game timeout detected for user:', userId, '- cleaning up');
             bjGames.delete(userId);
             return null;
