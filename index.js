@@ -1248,15 +1248,14 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     } else {
                         state.player.push(bjDraw(state));
-                    const pv = handValue(state.player);
-                    if (pv >= 21) {
+                        const pv = handValue(state.player);
+                        if (pv >= 21) {
                             await bjResolve(interaction, state, 'stand');
-                    } else {
+                        } else {
                             await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
+                        }
                     }
-                    }
-                }
-            } else if (action === 'stand') {
+                } else if (action === 'stand') {
                     if (state.split && state.currentSplitHand === 1) {
                         // Move to second hand
                         state.currentSplitHand = 2;
@@ -1264,7 +1263,7 @@ client.on('interactionCreate', async (interaction) => {
                     } else {
                         await bjResolve(interaction, state, 'stand');
                     }
-            } else if (action === 'double') {
+                } else if (action === 'double') {
                     if (!bjCanDouble(state)) { try { await interaction.followUp({ content: 'Cannot double now.', ephemeral: true }); } catch {} return; }
                     const bal = await getUserBalance(ownerId);
                     if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {} return; }
@@ -1289,11 +1288,11 @@ client.on('interactionCreate', async (interaction) => {
                         return;
                     }
 
-                const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) {
+                    const bal = await getUserBalance(ownerId);
+                    if (bal < state.bet) {
                         try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {}
-                    return;
-                }
+                        return;
+                    }
 
                     try {
                         await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
@@ -1317,22 +1316,22 @@ client.on('interactionCreate', async (interaction) => {
                         // Clean up corrupted game state
                         bjGames.delete(ownerId);
                     }
-            } else if (action === 'surrender') {
+                } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
-            } else if (action === 'newgame') {
-                // Start a new game - redirect to blackjack command
-                try {
-                    await interaction.followUp({
-                        content: 'Starting a new blackjack game...',
-                        ephemeral: true
-                    });
-                } catch (e) {
-                    console.error('New game message failed:', e);
+                } else if (action === 'newgame') {
+                    // Start a new game - redirect to blackjack command
+                    try {
+                        await interaction.followUp({
+                            content: 'Starting a new blackjack game...',
+                            ephemeral: true
+                        });
+                    } catch (e) {
+                        console.error('New game message failed:', e);
+                    }
+                    return;
                 }
-                return;
-            }
-        } catch (e) {
-            console.error('Blackjack button error:', e);
+            } catch (e) {
+                console.error('Blackjack button error:', e);
                 try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
             }
         } catch (error) {
