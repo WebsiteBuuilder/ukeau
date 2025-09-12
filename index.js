@@ -449,17 +449,9 @@ function bjComponents(state) {
         { type: 2, style: 4, label: '🏳️ SURRENDER', custom_id: `nbj_surrender:${state.userId}` }
     ];
 
-    // Row 3: Chip controls for betting (if enabled)
-    const row3 = [
-        { type: 2, style: 2, label: '💵 +100', custom_id: `nbj_bet_plus:${state.userId}` },
-        { type: 2, style: 2, label: '💰 -100', custom_id: `nbj_bet_minus:${state.userId}` },
-        { type: 2, style: 3, label: '🎰 MAX BET', custom_id: `nbj_bet_max:${state.userId}` }
-    ];
-
     const components = [];
     if (row1.length > 0) components.push({ type: 1, components: row1 });
     if (row2.length > 0) components.push({ type: 1, components: row2 });
-    if (row3.length > 0) components.push({ type: 1, components: row3 });
 
     return components;
 }
@@ -875,32 +867,6 @@ client.on('interactionCreate', async (interaction) => {
                 }
             } else if (action === 'surrender') {
                 await bjResolve(interaction, state, 'surrender');
-            } else if (action === 'bet_plus') {
-                // Increase bet by 100 (chip control)
-                const newBet = Math.min(state.bet + 100, await getUserBalance(ownerId));
-                if (newBet > state.bet) {
-                    state.bet = newBet;
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\n💵 Bet increased!' }, interaction);
-                } else {
-                    try { await interaction.followUp({ content: 'Cannot increase bet further.', ephemeral: true }); } catch {}
-                }
-            } else if (action === 'bet_minus') {
-                // Decrease bet by 100 (chip control)
-                const newBet = Math.max(1, state.bet - 100);
-                if (newBet < state.bet) {
-                    state.bet = newBet;
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\n💰 Bet decreased!' }, interaction);
-                }
-            } else if (action === 'bet_max') {
-                // Set to max bet (chip control)
-                const maxBet = await getUserBalance(ownerId);
-                if (maxBet > state.bet) {
-                    state.bet = maxBet;
-                    await bjUpdateView(state, { hideDealerHole: true, note: '\n🎰 Max bet set!' }, interaction);
-                } else {
-                    try { await interaction.followUp({ content: 'Already at max bet.', ephemeral: true }); } catch {}
-                }
-            }
         } catch (e) {
             console.error('Blackjack button error:', e);
             try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
