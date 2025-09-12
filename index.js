@@ -376,6 +376,9 @@ function bjBuildEmbed(state, opts = {}) {
     const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
 
+    // Get 24-hour winner info (async, but we'll use a cached version)
+    const winnerInfo = opts.topWinner ? `🏆 ${opts.topWinner.username || 'Unknown'} (+${opts.topWinner.net_wins})` : '💎 GLASSMORPHISM THEME';
+
     // Handle split hands with glassmorphism pill badges
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
     const playerLines = playerHands.map((hand, idx) => {
@@ -406,7 +409,7 @@ function bjBuildEmbed(state, opts = {}) {
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
         '║                        🎰 PREMIUM BLACKJACK CASINO 🎰                         ║',
-        '║                           💎 GLASSMORPHISM THEME 💎                           ║',
+        `║                      ${winnerInfo.padEnd(54,' ')} ║`,
         '╠════════════════════════════════════════════════════════════════════════════════╣',
         '║                                                                                ║',
         `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
@@ -436,7 +439,7 @@ function bjBuildEmbed(state, opts = {}) {
         .setColor(embedColor)
         .setTitle('🎰 PREMIUM BLACKJACK CASINO')
         .setDescription(`${table}${note}${gameStatus}`)
-        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 Glassmorphism Theme • ⚡ Lightning Fast` });
+        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 24h Top Winner • ⚡ Lightning Fast` });
 }
 
 function bjComponents(state) {
@@ -508,6 +511,11 @@ function bjComponents(state) {
 }
 
 async function bjUpdateView(state, opts = {}, interaction = null) {
+    // If no topWinner is provided, fetch it
+    if (!opts.topWinner) {
+        const topWinner = await get24HourTopWinner();
+        opts.topWinner = topWinner;
+    }
     const embed = bjBuildEmbed(state, opts);
     await updateGame(interaction, state, { embeds: [embed], components: bjComponents(state) });
 }
@@ -904,6 +912,35 @@ async function awardVouchPoint(message) {
     });
 }
 
+// Function to get top casino winner from last 24 hours
+async function get24HourTopWinner() {
+    return new Promise((resolve, reject) => {
+        // Get current time minus 24 hours
+        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+
+        // Query for net wins from casino games in last 24 hours
+        db.get(`
+            SELECT
+                user_id,
+                SUM(delta) as net_wins,
+                username
+            FROM ledger
+            WHERE reason LIKE 'blackjack_%' OR reason LIKE 'roulette_%' OR reason LIKE 'slots_%'
+            AND created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+            GROUP BY user_id
+            ORDER BY net_wins DESC
+            LIMIT 1
+        `, [], (err, row) => {
+            if (err) {
+                console.error('24-hour winner query error:', err);
+                resolve(null);
+                return;
+            }
+            resolve(row);
+        });
+    });
+}
+
 // Function to update live leaderboard in #leaderboard channel
 async function updateLiveLeaderboard(client) {
     try {
@@ -1074,25 +1111,34 @@ client.on('interactionCreate', async (interaction) => {
 
             // Get game state with better error handling
             let state = bjGames.get(ownerId);
+            console.log('Button interaction for user:', ownerId, 'Action:', action, 'State found:', !!state);
+
             const isLegacyOnly = !state && isOldBJ;
             if (!state && isLegacyOnly) {
                 try { await interaction.followUp({ content: 'Game was reset to new version. Start a fresh /blackjack.', ephemeral: true }); } catch {}
                 return;
             }
-            if (!state) { 
-                try { await interaction.followUp({ content: 'No active game found. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
-                return; 
+            if (!state) {
+                console.log('No active game found for user:', ownerId);
+                try { await interaction.followUp({ content: 'No active game found. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                return;
             }
             if (state.ended) { 
                 try { await interaction.followUp({ content: 'Game already finished. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
                 return; 
             }
             
-            // Check if game is too old (5 minutes timeout)
+            // Check if game is too old (5 minutes timeout) - but don't delete during split operations
             const gameAge = Date.now() - state.startedAt;
-            if (gameAge > 5 * 60 * 1000) {
+            if (gameAge > 5 * 60 * 1000 && !state.split) {
                 bjGames.delete(ownerId);
                 try { await interaction.followUp({ content: 'Game timed out after 5 minutes. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                return;
+            }
+            // Allow extra time for split games (10 minutes total)
+            if (gameAge > 10 * 60 * 1000) {
+                bjGames.delete(ownerId);
+                try { await interaction.followUp({ content: 'Game timed out after 10 minutes. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
                 return;
             }
 
@@ -1141,20 +1187,23 @@ client.on('interactionCreate', async (interaction) => {
                     state.player.push(bjDraw(state));
                     await bjResolve(interaction, state, 'stand');
                 } else if (action === 'split') {
+                    console.log('Split action triggered for user:', ownerId, 'State:', state);
+
                     if (!bjCanSplit(state)) {
                         try { await interaction.followUp({ content: 'Cannot split these cards. Cards must be the same rank (e.g., 8-8, J-Q, 10-K).', ephemeral: true }); } catch {}
                         return;
                     }
-                const bal = await getUserBalance(ownerId);
-                if (bal < state.bet) {
+
+                    const bal = await getUserBalance(ownerId);
+                    if (bal < state.bet) {
                         try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {}
-                    return;
-                }
+                        return;
+                    }
 
                     try {
                         await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
 
-                        // Split the hand
+                        // Split the hand - ensure state is properly maintained
                         state.split = true;
                         state.splitHand = [state.player[1]]; // Second card becomes split hand
                         state.player = [state.player[0]]; // First card stays in main hand
@@ -1164,10 +1213,14 @@ client.on('interactionCreate', async (interaction) => {
                         state.player.push(bjDraw(state));
                         state.splitHand.push(bjDraw(state));
 
+                        console.log('Split successful for user:', ownerId, 'Hands:', state.player, state.splitHand);
+
                         await bjUpdateView(state, { hideDealerHole: true, note: '\n🎉 Hands split successfully! Playing Hand 1.' }, interaction);
                     } catch (error) {
                         console.error('Split error:', error);
-                        try { await interaction.followUp({ content: 'Error processing split. Please try again.', ephemeral: true }); } catch {}
+                        try { await interaction.followUp({ content: 'Error processing split. Game state may be corrupted. Please start a new game.', ephemeral: true }); } catch {}
+                        // Clean up corrupted game state
+                        bjGames.delete(ownerId);
                     }
             } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
@@ -1312,7 +1365,13 @@ client.on('interactionCreate', async (interaction) => {
             bjGames.set(interaction.user.id, state);
             await bjDealInitial(state);
 
-            const initialEmbed = bjBuildEmbed(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' });
+            // Get 24-hour top winner for display
+            const topWinner = await get24HourTopWinner();
+            const initialEmbed = bjBuildEmbed(state, {
+                hideDealerHole: true,
+                note: '\nYour move: Hit, Stand, Double, or Surrender.',
+                topWinner: topWinner
+            });
             const components = [
                 {
                     type: 1,
@@ -1436,23 +1495,28 @@ client.on('interactionCreate', async (interaction) => {
             else if (betType === 'low' || betType === 'high') { if (result !== 0 && ((betType==='low' && result<=18) || (betType==='high' && result>=19))) win = amount * 2; }
             else if (betType === 'number' && Number.isInteger(number) && number >= 0 && number <= 36) { if (result === number) win = amount * 35; }
 
+            // Get 24-hour top winner for display
+            const topWinner = await get24HourTopWinner();
+            const winnerDisplay = topWinner ? `🏆 ${topWinner.username || 'Unknown'} (+${topWinner.net_wins})` : '💎 GLASSMORPHISM THEME';
+
             const wheelResult = `
 ╔══════════════════════════════════════╗
 ║        🎰 PREMIUM ROULETTE 🎰        ║
+║          ${winnerDisplay}          ║
 ║                                      ║
 ║           🏆 RESULT: ${result.toString().padStart(2,' ')} 🏆           ║
 ║                ${color==='red' ? '🔴' : color==='black' ? '⚫' : '🟢'}                ║
 ║                                      ║
 ║     ${win>0 ? '💰 WINNER! 💰' : '😤 BETTER LUCK NEXT TIME'}      ║
 ║                                      ║
-║   💎 ONLY IN OUR VIP CASINO 💎      ║
+║   🎲 24H TOP WINNER FEATURE 🎲     ║
 ╚══════════════════════════════════════╝`;
             const net = win - amount;
             const breakdown = `\nBet: ${amount} • Payout: ${win} • Net: ${net>=0?'+':''}${net}`;
             const embed = new EmbedBuilder()
                 .setColor(win > 0 ? '#00c853' : '#c62828')
                 .setDescription(wheelResult + breakdown)
-                .setFooter({ text: `Bet: ${amount} • VIP rewards available` });
+                .setFooter({ text: `Bet: ${amount} • 🎲 24h Top Winner • ⚡ Lightning Fast` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             // Balance after roulette
             try { const bal = await getUserBalance(interaction.user.id); await interaction.followUp({ content: `Current balance: ${bal} vouch points.`, ephemeral: true }); } catch {}
@@ -1509,18 +1573,25 @@ client.on('interactionCreate', async (interaction) => {
             if (a === b && b === c) payout = amount * 10;
             else if (a === b || b === c || a === c) payout = amount * 2;
             const line = `${a} ${b} ${c}`;
+
+            // Get 24-hour top winner for display
+            const topWinner = await get24HourTopWinner();
+            const winnerDisplay = topWinner ? `🏆 ${topWinner.username || 'Unknown'} (+${topWinner.net_wins})` : '💎 GLASSMORPHISM THEME';
+
             const resultBox = `
 ╔══════════════════════════════════════╗
 ║         💎 DIAMOND SLOT™ 💎          ║
-║       VIP-ONLY — HIGH LIMITS         ║
+║        ${winnerDisplay}        ║
 ║--------------------------------------║
 ║           ${line}           ║
 ║--------------------------------------║
 ║ ${payout>0 ? '💰 JACKPOT! CLAIM YOUR VIP REWARDS 💰' : '😤 MISS! TRY THE VIP LUCK AGAIN'} ║
+║                                      ║
+║    🎰 24H TOP WINNER FEATURE 🎰     ║
 ╚══════════════════════════════════════╝`;
             const net = payout - amount;
             const breakdown = `\nBet: ${amount} • Payout: ${payout} • Net: ${net>=0?'+':''}${net}`;
-            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox + breakdown).setFooter({ text: `Bet: ${amount}` });
+            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox + breakdown).setFooter({ text: `Bet: ${amount} • 🎰 24h Top Winner • ⚡ Lightning Fast` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
             if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
             // Balance after slots
