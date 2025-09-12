@@ -874,6 +874,9 @@ client.on('interactionCreate', async (interaction) => {
                 try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
             }
         return;
+    } catch (error) {
+        console.error('Button interaction error:', error);
+        try { await interaction.followUp({ content: '❌ An unexpected error occurred. Please try again.', ephemeral: true }); } catch {}
     }
 
     if (!interaction.isChatInputCommand()) return;
