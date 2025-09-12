@@ -855,13 +855,22 @@ async function awardVouchPoint(message) {
 // Function to update live leaderboard in #leaderboard channel
 async function updateLiveLeaderboard(client) {
     try {
-        // Find the leaderboard channel
-        const leaderboardChannel = client.channels.cache.find(ch =>
-            ch.name.toLowerCase() === 'leaderboard' && ch.type === 0
-        );
+        // Find the leaderboard channel using environment variable or by name
+        let leaderboardChannel = null;
+        
+        if (process.env.LEADERBOARD_CHANNEL_ID) {
+            leaderboardChannel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID).catch(() => null);
+        }
+        
+        // Fallback to finding by name if ID not found
+        if (!leaderboardChannel) {
+            leaderboardChannel = client.channels.cache.find(ch =>
+                ch.name.toLowerCase() === 'leaderboard' && ch.type === 0
+            );
+        }
 
         if (!leaderboardChannel) {
-            console.log('Leaderboard channel not found. Skipping leaderboard update.');
+            console.log('Leaderboard channel not found. Set LEADERBOARD_CHANNEL_ID or ensure #leaderboard channel exists.');
             return;
         }
 
@@ -881,25 +890,58 @@ async function updateLiveLeaderboard(client) {
             return;
         }
 
-        // Create leaderboard embed
+        // Create enhanced leaderboard embed with glassmorphism theme
         const embed = new EmbedBuilder()
-            .setColor('#ffd700')
-            .setTitle('🏆 Live Vouch Points Leaderboard')
-            .setDescription('Real-time rankings updated automatically!')
+            .setColor('#0f0f23')
+            .setTitle('🏆 LIVE VOUCH POINTS LEADERBOARD 🏆')
+            .setDescription('```\n╔════════════════════════════════════════╗\n║     💎 REAL-TIME RANKINGS 💎           ║\n║        Updated Automatically!          ║\n╚════════════════════════════════════════╝```')
             .setTimestamp()
-            .setFooter({ text: 'Updated when points are awarded' });
+            .setFooter({ 
+                text: `🔄 Auto-updates every 30 minutes • Last updated`, 
+                iconURL: client.user?.displayAvatarURL() 
+            });
 
-        let leaderboardText = '';
-        for (let i = 0; i < leaderboardData.length; i++) {
-            const { user_id, points, username } = leaderboardData[i];
-            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
+        // Split into top 10 and next 10 for better formatting
+        const top10 = leaderboardData.slice(0, 10);
+        const next10 = leaderboardData.slice(10, 20);
+
+        let top10Text = '';
+        for (let i = 0; i < top10.length; i++) {
+            const { user_id, points, username } = top10[i];
+            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : 
+                         i === 3 ? '🏅' : i === 4 ? '🎖️' : '🔹';
             const displayName = username || 'Unknown User';
-            leaderboardText += `${medal} **${i + 1}.** <@${user_id}> - **${points}** points\n`;
+            const pointsDisplay = points.toLocaleString();
+            top10Text += `${medal} **#${i + 1}** <@${user_id}> • **${pointsDisplay}** pts\n`;
         }
 
         embed.addFields({
-            name: '🏅 Rankings',
-            value: leaderboardText || 'No points awarded yet!',
+            name: '🏆 TOP 10 CHAMPIONS',
+            value: top10Text || 'No points awarded yet!',
+            inline: false
+        });
+
+        if (next10.length > 0) {
+            let next10Text = '';
+            for (let i = 0; i < next10.length; i++) {
+                const { user_id, points, username } = next10[i];
+                const rank = i + 11;
+                const pointsDisplay = points.toLocaleString();
+                next10Text += `🔸 **#${rank}** <@${user_id}> • **${pointsDisplay}** pts\n`;
+            }
+            embed.addFields({
+                name: '⭐ RISING STARS (11-20)',
+                value: next10Text,
+                inline: false
+            });
+        }
+
+        // Add total stats
+        const totalUsers = leaderboardData.length;
+        const totalPoints = leaderboardData.reduce((sum, user) => sum + user.points, 0);
+        embed.addFields({
+            name: '📊 SERVER STATS',
+            value: `👥 **${totalUsers}** Active Users • 💰 **${totalPoints.toLocaleString()}** Total Points`,
             inline: false
         });
 
@@ -910,7 +952,8 @@ async function updateLiveLeaderboard(client) {
             existingMessage = messages.find(msg =>
                 msg.author.id === client.user.id &&
                 msg.embeds.length > 0 &&
-                msg.embeds[0].title === '🏆 Live Vouch Points Leaderboard'
+                (msg.embeds[0].title === '🏆 Live Vouch Points Leaderboard' || 
+                 msg.embeds[0].title === '🏆 LIVE VOUCH POINTS LEADERBOARD 🏆')
             );
         } catch (error) {
             console.log('Error fetching messages:', error.message);
