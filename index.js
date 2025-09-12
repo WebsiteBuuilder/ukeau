@@ -397,6 +397,11 @@ function bjBuildEmbed(state, opts = {}) {
         return cardContainer + totalContainer;
     }).join('\n╟────────────────────────────────────────────────────────────────────────────╢');
 
+    // Add countdown timer if game is active
+    const gameAge = Date.now() - state.startedAt;
+    const timeLeft = Math.max(0, Math.floor((30000 - gameAge) / 1000)); // 30 second timeout
+    const timerDisplay = state.ended ? '⏰ GAME ENDED' : timeLeft > 0 ? `⏰ ${timeLeft}s left` : '⏰ TIMING OUT...';
+
     // Glassmorphism table design with enhanced borders
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
@@ -411,6 +416,7 @@ function bjBuildEmbed(state, opts = {}) {
         '║                                                                                ║',
         playerLines,
         '║                                                                                ║',
+        `║ ${timerDisplay.padEnd(78,' ')}║`,
         '╚════════════════════════════════════════════════════════════════════════════════╝'
     ].join('\n');
 
@@ -434,19 +440,64 @@ function bjBuildEmbed(state, opts = {}) {
 }
 
 function bjComponents(state) {
-    if (state.ended) return [];
+    if (state.ended) {
+        // Return disabled buttons when game is over
+        return [
+            {
+                type: 1,
+                components: [
+                    { type: 2, style: 2, label: '🎮 GAME ENDED', custom_id: 'ended', disabled: true },
+                    { type: 2, style: 4, label: '🔄 NEW GAME', custom_id: `nbj_newgame:${state.userId}`, disabled: false }
+                ]
+            }
+        ];
+    }
+
+    // Check if game has timed out (older than 35 seconds)
+    const gameAge = Date.now() - state.startedAt;
+    const isTimedOut = gameAge > 35000;
 
     // Row 1: Core actions with glassmorphism styling
     const row1 = [
-        { type: 2, style: 1, label: '🎯 HIT', custom_id: `nbj_hit:${state.userId}` },
-        { type: 2, style: 2, label: '✋ STAND', custom_id: `nbj_stand:${state.userId}` },
-        { type: 2, style: 3, label: '💰 DOUBLE', custom_id: `nbj_double:${state.userId}`, disabled: !bjCanDouble(state) }
+        {
+            type: 2,
+            style: 1,
+            label: isTimedOut ? '⏰ TIMED OUT' : '🎯 HIT',
+            custom_id: `nbj_hit:${state.userId}`,
+            disabled: isTimedOut
+        },
+        {
+            type: 2,
+            style: 2,
+            label: isTimedOut ? '⏰ TIMED OUT' : '✋ STAND',
+            custom_id: `nbj_stand:${state.userId}`,
+            disabled: isTimedOut
+        },
+        {
+            type: 2,
+            style: 3,
+            label: isTimedOut ? '⏰ TIMED OUT' : '💰 DOUBLE',
+            custom_id: `nbj_double:${state.userId}`,
+            disabled: isTimedOut || !bjCanDouble(state)
+        }
     ];
 
     // Row 2: Advanced actions with visual states
     const row2 = [
-        { type: 2, style: 1, label: '✂️ SPLIT', custom_id: `nbj_split:${state.userId}`, disabled: !bjCanSplit(state) },
-        { type: 2, style: 4, label: '🏳️ SURRENDER', custom_id: `nbj_surrender:${state.userId}` }
+        {
+            type: 2,
+            style: 1,
+            label: isTimedOut ? '⏰ TIMED OUT' : '✂️ SPLIT',
+            custom_id: `nbj_split:${state.userId}`,
+            disabled: isTimedOut || !bjCanSplit(state)
+        },
+        {
+            type: 2,
+            style: 4,
+            label: isTimedOut ? '⏰ TIMED OUT' : '🏳️ SURRENDER',
+            custom_id: `nbj_surrender:${state.userId}`,
+            disabled: isTimedOut
+        }
     ];
 
     const components = [];
@@ -1006,7 +1057,18 @@ client.on('interactionCreate', async (interaction) => {
             const action = prefix.replace('nbj_', '').replace('bj_', '');
             // Always acknowledge immediately to avoid interaction failure
             if (!interaction.deferred && !interaction.replied) {
-                await interaction.deferUpdate().catch(async () => { try { await interaction.reply({ content: 'Working…', ephemeral: true }); } catch {} });
+                try {
+                    await interaction.deferUpdate();
+                } catch (deferError) {
+                    console.error('Defer update failed:', deferError);
+                    // If defer fails, try to reply
+                    try {
+                        await interaction.reply({ content: 'Processing your action...', ephemeral: true });
+                    } catch (replyError) {
+                        console.error('Reply failed too:', replyError);
+                        return; // Can't continue if both defer and reply fail
+                    }
+                }
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
 
@@ -1109,6 +1171,17 @@ client.on('interactionCreate', async (interaction) => {
                     }
             } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
+            } else if (action === 'newgame') {
+                // Start a new game - redirect to blackjack command
+                try {
+                    await interaction.followUp({
+                        content: 'Starting a new blackjack game...',
+                        ephemeral: true
+                    });
+                } catch (e) {
+                    console.error('New game message failed:', e);
+                }
+                return;
             }
             } catch (e) {
                 console.error('Blackjack button error:', e);
@@ -1266,12 +1339,29 @@ client.on('interactionCreate', async (interaction) => {
             // Ensure initial view drew; also try a second update via editReply to avoid any race
             await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' }, interaction);
 
-            // Auto-timeout to stand after 60s (increased from 30s)
+            // Auto-timeout to stand after 30s (reasonable for user experience)
             setTimeout(async () => {
                 const s = bjGames.get(interaction.user.id);
                 if (!s || s.ended) return;
+
+                // Mark game as ended to prevent further actions
+                s.ended = true;
+                bjGames.delete(interaction.user.id);
+
+                // Try to update the message to show timeout
+                try {
+                    const embed = bjBuildEmbed(s, {
+                        note: '\n⏰ **GAME TIMED OUT** - You took too long to respond!\nDealer automatically stands for you.',
+                        result: 'lose'
+                    });
+                    await updateGame(interaction, s, { embeds: [embed], components: [] });
+                } catch (e) {
+                    console.error('Timeout message update failed:', e);
+                }
+
+                // Resolve the game
                 await bjResolve(interaction, s, 'stand', true);
-            }, 60000);
+            }, 30000); // 30 seconds timeout
         } catch (e) {
             console.error('Blackjack start error:', e);
             // Refund if failed
