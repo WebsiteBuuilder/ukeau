@@ -649,6 +649,17 @@ client.once('ready', async () => {
     await ensureUsernameColumn();
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
+
+    // Set up periodic leaderboard updates (every 30 minutes)
+    setInterval(async () => {
+        try {
+            await updateLiveLeaderboard(client);
+        } catch (error) {
+            console.error('Periodic leaderboard update error:', error);
+        }
+    }, 30 * 60 * 1000); // 30 minutes
+
+    console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
 });
 
 // Message event handler
@@ -714,6 +725,10 @@ async function awardVouchPoint(message) {
                     
                     const newPoints = row.points + pointsToAdd;
                     sendVouchAwardMessage(message, username, pointsToAdd, newPoints);
+                    // Update live leaderboard
+                    if (client) {
+                        updateLiveLeaderboard(client).catch(err => console.error('Leaderboard update error:', err));
+                    }
                     resolve(newPoints);
                 });
             } else {
@@ -726,11 +741,93 @@ async function awardVouchPoint(message) {
                     }
                     
                     sendVouchAwardMessage(message, username, pointsToAdd, pointsToAdd);
+                    // Update live leaderboard
+                    if (client) {
+                        updateLiveLeaderboard(client).catch(err => console.error('Leaderboard update error:', err));
+                    }
                     resolve(pointsToAdd);
                 });
             }
         });
     });
+}
+
+// Function to update live leaderboard in #leaderboard channel
+async function updateLiveLeaderboard(client) {
+    try {
+        // Find the leaderboard channel
+        const leaderboardChannel = client.channels.cache.find(ch =>
+            ch.name.toLowerCase() === 'leaderboard' && ch.type === 0
+        );
+
+        if (!leaderboardChannel) {
+            console.log('Leaderboard channel not found. Skipping leaderboard update.');
+            return;
+        }
+
+        // Get leaderboard data
+        const leaderboardData = await new Promise((resolve, reject) => {
+            db.all('SELECT user_id, points, username FROM vouch_points ORDER BY points DESC LIMIT 20', [], (err, rows) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                resolve(rows || []);
+            });
+        });
+
+        if (leaderboardData.length === 0) {
+            console.log('No leaderboard data available.');
+            return;
+        }
+
+        // Create leaderboard embed
+        const embed = new EmbedBuilder()
+            .setColor('#ffd700')
+            .setTitle('🏆 Live Vouch Points Leaderboard')
+            .setDescription('Real-time rankings updated automatically!')
+            .setTimestamp()
+            .setFooter({ text: 'Updated when points are awarded' });
+
+        let leaderboardText = '';
+        for (let i = 0; i < leaderboardData.length; i++) {
+            const { user_id, points, username } = leaderboardData[i];
+            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
+            const displayName = username || 'Unknown User';
+            leaderboardText += `${medal} **${i + 1}.** <@${user_id}> - **${points}** points\n`;
+        }
+
+        embed.addFields({
+            name: '🏅 Rankings',
+            value: leaderboardText || 'No points awarded yet!',
+            inline: false
+        });
+
+        // Try to find existing leaderboard message
+        let existingMessage = null;
+        try {
+            const messages = await leaderboardChannel.messages.fetch({ limit: 50 });
+            existingMessage = messages.find(msg =>
+                msg.author.id === client.user.id &&
+                msg.embeds.length > 0 &&
+                msg.embeds[0].title === '🏆 Live Vouch Points Leaderboard'
+            );
+        } catch (error) {
+            console.log('Error fetching messages:', error.message);
+        }
+
+        // Update or create the leaderboard message
+        if (existingMessage) {
+            await existingMessage.edit({ embeds: [embed] });
+            console.log('✅ Updated existing leaderboard message');
+        } else {
+            await leaderboardChannel.send({ embeds: [embed] });
+            console.log('✅ Created new leaderboard message');
+        }
+
+    } catch (error) {
+        console.error('Error updating live leaderboard:', error);
+    }
 }
 
 // Function to send vouch award message
@@ -935,6 +1032,8 @@ client.on('interactionCreate', async (interaction) => {
                         return;
                     }
                     interaction.reply({ content: `Updated ${targetUser.username}'s points to ${newPoints}.` });
+                    // Update live leaderboard
+                    updateLiveLeaderboard(interaction.client).catch(err => console.error('Leaderboard update error:', err));
                 });
             } else {
                 const initial = Math.max(0, delta);
@@ -944,7 +1043,9 @@ client.on('interactionCreate', async (interaction) => {
                         interaction.reply({ content: '❌ Error updating points.', ephemeral: true });
                         return;
                     }
-                    interaction.reply({ content: `Set ${targetUser.username}'s points to ${initial}.` });
+                        interaction.reply({ content: `Set ${targetUser.username}'s points to ${initial}.` });
+                        // Update live leaderboard
+                        updateLiveLeaderboard(interaction.client).catch(err => console.error('Leaderboard update error:', err));
                 });
             }
         });
@@ -1415,12 +1516,12 @@ client.on('interactionCreate', async (interaction) => {
                 interaction.reply({ content: '❌ Error retrieving leaderboard!', ephemeral: true });
                 return;
             }
-            
+
             if (rows.length === 0) {
                 interaction.reply({ content: '📊 No vouch points have been awarded yet!', ephemeral: true });
                 return;
             }
-            
+
             let leaderboardText = '';
             for (let i = 0; i < rows.length; i++) {
                 const { user_id, points, username } = rows[i];
@@ -1436,15 +1537,37 @@ client.on('interactionCreate', async (interaction) => {
                     }).catch(() => {});
                 }
             }
-            
+
             const embed = new EmbedBuilder()
                 .setColor('#ffd700')
                 .setTitle('🏆 Vouch Points Leaderboard')
                 .setDescription(leaderboardText)
                 .setTimestamp();
-            
+
             interaction.reply({ embeds: [embed] });
         });
+    }
+
+    if (interaction.commandName === 'updateleaderboard') {
+        if (!interaction.inGuild()) {
+            interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+            return;
+        }
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        if (!isAdmin) {
+            interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+            return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            await updateLiveLeaderboard(interaction.client);
+            await interaction.editReply('✅ Live leaderboard has been updated in the #leaderboard channel!');
+        } catch (error) {
+            console.error('Manual leaderboard update error:', error);
+            await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
+        }
     }
 });
 
@@ -1465,6 +1588,12 @@ client.once('ready', async () => {
         },
         { name: 'leaderboard', description: 'View the vouch points leaderboard' },
         { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
+        {
+            name: 'updateleaderboard',
+            description: 'Admin: Force update the live leaderboard in #leaderboard channel',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false
+        },
         {
             name: 'blackjack',
             description: 'Play blackjack against the dealer',
