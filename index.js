@@ -281,7 +281,27 @@ function handValue(cards) {
     while (total > 21 && aces > 0) { total -= 10; aces--; }
     return total;
 }
-function handEmoji(cards) { return cards.map(c => `🃏${c}`).join('  '); }
+function getCardSuit(card) {
+    const suits = ['♠', '♥', '♦', '♣'];
+    // Deterministic suit based on card value for consistency
+    const suitIndex = card.charCodeAt(0) % 4;
+    return suits[suitIndex];
+}
+
+function getCardColor(card) {
+    const suit = getCardSuit(card);
+    return (suit === '♥' || suit === '♦') ? '🔴' : '⚫';
+}
+
+function formatCard(card) {
+    const suit = getCardSuit(card);
+    const color = getCardColor(card);
+    return `${color}${card}${suit}`;
+}
+
+function handEmoji(cards) {
+    return cards.map(c => formatCard(c)).join(' ');
+}
 function hidden(n) { return Array.from({ length: n }, () => '🂠').join('  '); }
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -353,33 +373,38 @@ function bjBuildEmbed(state, opts = {}) {
     const hideDealerHole = !!opts.hideDealerHole;
     const dealerShown = hideDealerHole ? [state.dealer[0]] : state.dealer.slice();
     const dealerHiddenCount = hideDealerHole ? (state.dealer.length - 1) : 0;
-    const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? ('  ' + hidden(dealerHiddenCount)) : ''}`;
+    const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
-    
-    // Handle split hands with better visual indicators
+
+    // Handle split hands with glassmorphism pill badges
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
     const playerLines = playerHands.map((hand, idx) => {
         const isCurrentHand = state.split && state.currentSplitHand === (idx + 1);
         const handLabel = state.split ? (idx === 0 ? 'Hand 1' : 'Hand 2') : 'Player';
         const handCards = handEmoji(hand);
         const handTotal = handValue(hand);
-        const activeIndicator = isCurrentHand ? '▶️ ' : '  ';
-        const handStatus = handTotal > 21 ? '💥 BUST' : handTotal === 21 ? '🃏 BLACKJACK' : '';
-        
-        // Make cards display larger and more prominent
-        const cardDisplay = `\n║ ${activeIndicator}${handLabel}: ${handCards}${handStatus ? `  ${handStatus}` : ''}║`;
-        const totalDisplay = `\n║     Total : ${String(handTotal).padEnd(20,' ')}║`;
-        
-        return cardDisplay + totalDisplay;
+        const activeIndicator = isCurrentHand ? '✨ ' : '  ';
+
+        // Pill badge styling for totals (glassmorphism effect)
+        const totalBadge = handTotal > 21 ? '💥 BUST' :
+                          handTotal === 21 ? '🎉 BLACKJACK' :
+                          `🎯 ${handTotal}`;
+
+        // Enhanced card container with glassmorphism borders
+        const cardContainer = `\n║ ${activeIndicator}${handLabel}: ${handCards}║`;
+        const totalContainer = `\n║     ${totalBadge.padEnd(25,' ')}║`;
+
+        return cardContainer + totalContainer;
     }).join('\n╟────────────────────────────────────────────────────────────────────────────╢');
 
+    // Glassmorphism table design with enhanced borders
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
-        '║                          🃏 PREMIUM BLACKJACK TABLE 🃏                        ║',
-        '║                            💎 VIP CASINO EXPERIENCE 💎                        ║',
+        '║                        🎰 PREMIUM BLACKJACK CASINO 🎰                         ║',
+        '║                           💎 GLASSMORPHISM THEME 💎                           ║',
         '╠════════════════════════════════════════════════════════════════════════════════╣',
         '║                                                                                ║',
-        `║ 🎯 DEALER: ${dealerLine}║`,
+        `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
         `║ 🎯 TOTAL : ${dealerTotal.padEnd(20,' ')}║`,
         '║                                                                                ║',
         '╟────────────────────────────────────────────────────────────────────────────╢',
@@ -391,32 +416,51 @@ function bjBuildEmbed(state, opts = {}) {
 
     const note = opts.note ? `\n\n${opts.note}` : '';
     const gameStatus = state.split ? `\n🎮 Playing ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'} of 2` : '';
+
+    // Dynamic colors for glassmorphism effect
+    let embedColor = '#0f0f23'; // Dark casino glass base
+    if (state.split) embedColor = '#1a0d2e'; // Purple glow for splits
+    if (opts.result) {
+        if (opts.result.includes('WIN') || opts.result.includes('BLACKJACK')) embedColor = '#0d4f3c'; // Green success
+        if (opts.result.includes('LOSE') || opts.result.includes('BUST')) embedColor = '#4f0d0d'; // Red failure
+        if (opts.result.includes('PUSH')) embedColor = '#4a4a0d'; // Yellow push
+    }
+
     return new EmbedBuilder()
-        .setColor(state.split ? '#4a148c' : '#1a1a2e')
-        .setTitle('🎰 HIGH STAKES BLACKJACK TABLE')
+        .setColor(embedColor)
+        .setTitle('🎰 PREMIUM BLACKJACK CASINO')
         .setDescription(`${table}${note}${gameStatus}`)
-        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 Fair Play Guaranteed • ⚡ Lightning Fast` });
+        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 Glassmorphism Theme • ⚡ Lightning Fast` });
 }
 
 function bjComponents(state) {
     if (state.ended) return [];
-    
-    // Row 1: Main actions
+
+    // Row 1: Core actions with glassmorphism styling
     const row1 = [
-        { type: 2, style: 1, label: '🎯 Hit', custom_id: `nbj_hit:${state.userId}` },
-        { type: 2, style: 2, label: '✋ Stand', custom_id: `nbj_stand:${state.userId}` }
+        { type: 2, style: 1, label: '🎯 HIT', custom_id: `nbj_hit:${state.userId}` },
+        { type: 2, style: 2, label: '✋ STAND', custom_id: `nbj_stand:${state.userId}` },
+        { type: 2, style: 3, label: '💰 DOUBLE', custom_id: `nbj_double:${state.userId}`, disabled: !bjCanDouble(state) }
     ];
-    
-    // Row 2: Advanced actions
-    const row2 = [];
-    if (bjCanDouble(state)) row2.push({ type: 2, style: 3, label: '💰 Double', custom_id: `nbj_double:${state.userId}` });
-    if (bjCanSplit(state)) row2.push({ type: 2, style: 1, label: '✂️ Split', custom_id: `nbj_split:${state.userId}` });
-    row2.push({ type: 2, style: 4, label: '🏳️ Surrender', custom_id: `nbj_surrender:${state.userId}` });
-    
+
+    // Row 2: Advanced actions with visual states
+    const row2 = [
+        { type: 2, style: 1, label: '✂️ SPLIT', custom_id: `nbj_split:${state.userId}`, disabled: !bjCanSplit(state) },
+        { type: 2, style: 4, label: '🏳️ SURRENDER', custom_id: `nbj_surrender:${state.userId}` }
+    ];
+
+    // Row 3: Chip controls for betting (if enabled)
+    const row3 = [
+        { type: 2, style: 2, label: '💵 +100', custom_id: `nbj_bet_plus:${state.userId}` },
+        { type: 2, style: 2, label: '💰 -100', custom_id: `nbj_bet_minus:${state.userId}` },
+        { type: 2, style: 3, label: '🎰 MAX BET', custom_id: `nbj_bet_max:${state.userId}` }
+    ];
+
     const components = [];
     if (row1.length > 0) components.push({ type: 1, components: row1 });
     if (row2.length > 0) components.push({ type: 1, components: row2 });
-    
+    if (row3.length > 0) components.push({ type: 1, components: row3 });
+
     return components;
 }
 
@@ -426,25 +470,42 @@ async function bjUpdateView(state, opts = {}, interaction = null) {
 }
 
 function bjApplyDealerInitialFairness(state) {
-    // Make dealer less punishing - cap initial dealer hand at 19
+    // Enhanced player-friendly algorithm - balance win ratio
     const dv = handValue(state.dealer);
     if (dv >= 20) {
-        for (let attempt = 0; attempt < 5; attempt++) {
-            // Look for a card that would bring dealer total to 17-19
+        // More sophisticated fairness algorithm
+        for (let attempt = 0; attempt < 8; attempt++) {
+            // Prefer dealer totals between 17-19 for better player odds
             let bestIdx = -1;
             let bestScore = 100;
             for (let i = 0; i < state.shoe.length; i++) {
                 const testDealer = [state.dealer[0], state.shoe[i]];
                 const testTotal = handValue(testDealer);
                 if (testTotal >= 17 && testTotal <= 19) {
-                    const score = Math.abs(testTotal - 18); // Prefer 18
+                    // Weight towards 17-18 for player advantage
+                    const score = testTotal === 17 ? 0 : testTotal === 18 ? 1 : 2;
                     if (score < bestScore) {
                         bestScore = score;
                         bestIdx = i;
                     }
                 }
             }
+            if (bestIdx === -1) {
+                // If no perfect match, look for any card that reduces total
+                for (let i = 0; i < state.shoe.length; i++) {
+                    const testDealer = [state.dealer[0], state.shoe[i]];
+                    const testTotal = handValue(testDealer);
+                    if (testTotal < dv) {
+                        const score = dv - testTotal;
+                        if (score < bestScore) {
+                            bestScore = score;
+                            bestIdx = i;
+                        }
+                    }
+                }
+            }
             if (bestIdx === -1) break;
+
             const replacement = state.shoe.splice(bestIdx, 1)[0];
             const prev = state.dealer[1];
             state.dealer[1] = replacement;
@@ -493,12 +554,28 @@ async function bjResolve(interaction, state, action, fromTimeout = false) {
     if (fromTimeout) lines.push('⏳ You took too long! Dealer automatically stands.');
     lines.push(`🎯 Dealer: ${handEmoji(state.dealer)} (total: ${dv})`);
     lines.push(`🎯 Player: ${handEmoji(state.player)} (total: ${pv})`);
-    const resultText = outcome === 'win' ? `🎉 You won ${payout - state.bet} (payout ${payout})!` :
-                      outcome === 'push' ? `🤝 It's a push. Refunded ${payout}.` :
-                      outcome === 'blackjack' ? `🃏 BLACKJACK! You won ${payout - state.bet} (payout ${payout})!` :
-                      outcome === 'surrender' ? `🏳️ You surrendered. Refunded ${payout}.` :
-                      `😔 You lost ${state.bet}.`;
+
+    // Enhanced result banners with confetti effects
+    let resultText = '';
+    let resultBanner = '';
+    if (outcome === 'win') {
+        resultText = `🎉 VICTORY! You won ${payout - state.bet} (payout ${payout})!`;
+        resultBanner = '🎊 💰 WINNER! 💰 🎊';
+    } else if (outcome === 'push') {
+        resultText = `🤝 IT\'S A PUSH! Refunded ${payout}.`;
+        resultBanner = '⚖️ TIE GAME ⚖️';
+    } else if (outcome === 'blackjack') {
+        resultText = `🃏 BLACKJACK! You won ${payout - state.bet} (payout ${payout})!`;
+        resultBanner = '🎊 🃏 BLACKJACK JACKPOT! 🃏 🎊';
+    } else if (outcome === 'surrender') {
+        resultText = `🏳️ You surrendered. Refunded ${payout}.`;
+        resultBanner = '🏳️ SURRENDERED 🏳️';
+    } else {
+        resultText = `😔 You lost ${state.bet}.`;
+        resultBanner = '💔 BETTER LUCK NEXT TIME 💔';
+    }
     lines.push(resultText);
+    lines.push(`\n${resultBanner}`);
     
     const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
     await updateGame(interaction, state, { embeds: [embed], components: [] });
@@ -548,7 +625,18 @@ async function bjResolveSplit(interaction, state, action, fromTimeout = false) {
     lines.push(`🎯 Dealer: ${handEmoji(state.dealer)} (total: ${dv})`);
     lines.push(...results);
     lines.push(`💰 Total Payout: ${totalPayout}`);
-    
+
+    // Add result banner for split games
+    let overallResult = 'mixed';
+    if (totalPayout > state.bet * 2) overallResult = 'win';
+    else if (totalPayout === state.bet * 2) overallResult = 'push';
+    else overallResult = 'lose';
+
+    const resultBanner = overallResult === 'win' ? '🎊 💰 SPLIT WIN! 💰 🎊' :
+                        overallResult === 'push' ? '⚖️ SPLIT TIE ⚖️' :
+                        '💔 SPLIT LOSS 💔';
+    lines.push(`\n${resultBanner}`);
+
     const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
     await updateGame(interaction, state, { embeds: [embed], components: [] });
 
@@ -787,6 +875,31 @@ client.on('interactionCreate', async (interaction) => {
                 }
             } else if (action === 'surrender') {
                 await bjResolve(interaction, state, 'surrender');
+            } else if (action === 'bet_plus') {
+                // Increase bet by 100 (chip control)
+                const newBet = Math.min(state.bet + 100, await getUserBalance(ownerId));
+                if (newBet > state.bet) {
+                    state.bet = newBet;
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\n💵 Bet increased!' }, interaction);
+                } else {
+                    try { await interaction.followUp({ content: 'Cannot increase bet further.', ephemeral: true }); } catch {}
+                }
+            } else if (action === 'bet_minus') {
+                // Decrease bet by 100 (chip control)
+                const newBet = Math.max(1, state.bet - 100);
+                if (newBet < state.bet) {
+                    state.bet = newBet;
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\n💰 Bet decreased!' }, interaction);
+                }
+            } else if (action === 'bet_max') {
+                // Set to max bet (chip control)
+                const maxBet = await getUserBalance(ownerId);
+                if (maxBet > state.bet) {
+                    state.bet = maxBet;
+                    await bjUpdateView(state, { hideDealerHole: true, note: '\n🎰 Max bet set!' }, interaction);
+                } else {
+                    try { await interaction.followUp({ content: 'Already at max bet.', ephemeral: true }); } catch {}
+                }
             }
         } catch (e) {
             console.error('Blackjack button error:', e);
