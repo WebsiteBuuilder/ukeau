@@ -666,6 +666,7 @@ client.once('ready', async () => {
         {
             name: 'vouchpoints',
             description: 'Check your or someone else\'s vouch points',
+            dm_permission: true, // Explicitly allow in DMs
             options: [
                 {
                     name: 'user',
@@ -675,7 +676,7 @@ client.once('ready', async () => {
                 }
             ]
         },
-        { name: 'leaderboard', description: 'View the vouch points leaderboard' },
+        { name: 'leaderboard', description: 'View the vouch points leaderboard', dm_permission: true },
         { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
         {
             name: 'updateleaderboard',
@@ -1124,6 +1125,7 @@ client.on('interactionCreate', async (interaction) => {
     
     if (interaction.commandName === 'vouchpoints') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
+        const isOwnPoints = targetUser.id === interaction.user.id;
         
         db.get('SELECT points, username FROM vouch_points WHERE user_id = ?', [targetUser.id], (err, row) => {
             if (err) {
@@ -1133,14 +1135,37 @@ client.on('interactionCreate', async (interaction) => {
             }
             
             const points = row ? row.points : 0;
-            const embed = new EmbedBuilder()
-                .setColor('#0099ff')
-                .setTitle('📊 Vouch Points')
-                .setDescription(`${(row?.username) || targetUser.username} has **${points}** vouch points!`)
-                .setThumbnail(targetUser.displayAvatarURL())
-                .setTimestamp();
+            const displayName = (row?.username) || targetUser.username;
+            const pointsFormatted = points.toLocaleString();
             
-            interaction.reply({ embeds: [embed] });
+            // Get rank position
+            db.get('SELECT COUNT(*) + 1 as rank FROM vouch_points WHERE points > ?', [points], (err2, rankRow) => {
+                const rank = rankRow ? rankRow.rank : 'Unranked';
+                
+                const embed = new EmbedBuilder()
+                    .setColor(points > 0 ? '#00ff00' : '#0099ff')
+                    .setTitle(`💰 ${isOwnPoints ? 'Your' : displayName + "'s"} Vouch Points`)
+                    .setDescription(
+                        `${isOwnPoints ? 'You have' : `${displayName} has`} **${pointsFormatted}** vouch points!\n` +
+                        `🏆 Server Rank: **#${rank}**`
+                    )
+                    .setThumbnail(targetUser.displayAvatarURL())
+                    .setTimestamp()
+                    .setFooter({ 
+                        text: isOwnPoints ? 'Keep posting pictures to earn more points!' : 'Use /vouchpoints to check your own points'
+                    });
+                
+                // Add field showing how points are earned (only for own points or if user has 0 points)
+                if (isOwnPoints || points === 0) {
+                    embed.addFields({
+                        name: '📝 How to Earn Points',
+                        value: '• Post pictures in vouch channels\n• Tag a Provider in your message\n• Points are awarded automatically!',
+                        inline: false
+                    });
+                }
+                
+                interaction.reply({ embeds: [embed] });
+            });
         });
     }
     
