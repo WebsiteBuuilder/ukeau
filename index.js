@@ -1569,7 +1569,6 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
         }
     }
-});
 
 // Register slash commands when bot starts
 client.once('ready', async () => {
@@ -1677,6 +1676,8 @@ client.once('ready', async () => {
 client.on('error', console.error);
 process.on('unhandledRejection', error => {
     console.error('Unhandled promise rejection:', error);
+});
+
 });
 
 // Login to Discord
