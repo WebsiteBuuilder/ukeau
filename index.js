@@ -376,8 +376,14 @@ function bjBuildEmbed(state, opts = {}) {
     const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
 
-    // Get 24-hour winner info (async, but we'll use a cached version)
-    const winnerInfo = opts.topWinner ? `🏆 ${opts.topWinner.username || 'Unknown'} (+${opts.topWinner.net_wins})` : '💎 GLASSMORPHISM THEME';
+    // Get 24-hour winner info with better fallback
+    let winnerInfo = '💎 VIP CASINO EXPERIENCE';
+    if (opts.topWinner && opts.topWinner.username) {
+        const netWins = opts.topWinner.net_wins || 0;
+        winnerInfo = `🏆 ${opts.topWinner.username} (+${netWins.toLocaleString()})`;
+    } else if (opts.topWinner === null) {
+        winnerInfo = '💎 NO WINNERS YET TODAY';
+    }
 
     // Handle split hands with glassmorphism pill badges
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
@@ -718,7 +724,30 @@ client.once('ready', async () => {
         }
     }, 30 * 60 * 1000); // 30 minutes
 
+    // Set up game state cleanup (every 5 minutes)
+    setInterval(() => {
+        try {
+            let cleaned = 0;
+            const now = Date.now();
+            for (const [userId, state] of bjGames.entries()) {
+                const gameAge = now - state.startedAt;
+                const maxAge = state.split ? 15 * 60 * 1000 : 8 * 60 * 1000; // 15min for splits, 8min for regular
+
+                if (gameAge > maxAge || state.ended || !state.player || !Array.isArray(state.player)) {
+                    bjGames.delete(userId);
+                    cleaned++;
+                }
+            }
+            if (cleaned > 0) {
+                console.log(`🧹 Cleaned up ${cleaned} expired/frozen blackjack games`);
+            }
+        } catch (error) {
+            console.error('Game cleanup error:', error);
+        }
+    }, 5 * 60 * 1000); // 5 minutes
+
     console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
+    console.log('🧹 Game cleanup system initialized - runs every 5 minutes');
 
     // Register slash commands
     const commands = [
@@ -941,16 +970,45 @@ async function get24HourTopWinner() {
     });
 }
 
+// Function to recover from game state corruption
+function recoverGameState(userId) {
+    try {
+        const state = bjGames.get(userId);
+        if (!state) return null;
+
+        // Check for corrupted state
+        if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
+            console.log('Corrupted game state detected for user:', userId, '- cleaning up');
+            bjGames.delete(userId);
+            return null;
+        }
+
+        // Check if game is too old
+        const gameAge = Date.now() - state.startedAt;
+        if (gameAge > (state.split ? 15 * 60 * 1000 : 8 * 60 * 1000)) { // 15min for splits, 8min for regular
+            console.log('Game timeout detected for user:', userId, '- cleaning up');
+            bjGames.delete(userId);
+            return null;
+        }
+
+        return state;
+    } catch (error) {
+        console.error('Error recovering game state for user:', userId, error);
+        bjGames.delete(userId);
+        return null;
+    }
+}
+
 // Function to update live leaderboard in #leaderboard channel
 async function updateLiveLeaderboard(client) {
     try {
         // Find the leaderboard channel using environment variable or by name
         let leaderboardChannel = null;
-        
+
         if (process.env.LEADERBOARD_CHANNEL_ID) {
             leaderboardChannel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID).catch(() => null);
         }
-        
+
         // Fallback to finding by name if ID not found
         if (!leaderboardChannel) {
             leaderboardChannel = client.channels.cache.find(ch =>
@@ -1109,8 +1167,8 @@ client.on('interactionCreate', async (interaction) => {
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
 
-            // Get game state with better error handling
-            let state = bjGames.get(ownerId);
+            // Get game state with recovery mechanism
+            let state = recoverGameState(ownerId);
             console.log('Button interaction for user:', ownerId, 'Action:', action, 'State found:', !!state);
 
             const isLegacyOnly = !state && isOldBJ;
@@ -1143,6 +1201,14 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             try {
+                // Validate game state before processing action
+                if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
+                    console.error('Invalid game state for user:', ownerId);
+                    bjGames.delete(ownerId);
+                    try { await interaction.followUp({ content: 'Game state corrupted. Please start a new game.', ephemeral: true }); } catch {}
+                    return;
+                }
+
                 if (action === 'hit') {
                     if (state.split) {
                         // Handle split hand hitting - alternate between hands
@@ -1168,6 +1234,7 @@ client.on('interactionCreate', async (interaction) => {
                     } else {
                             await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
                     }
+                    }
                 }
             } else if (action === 'stand') {
                     if (state.split && state.currentSplitHand === 1) {
@@ -1189,16 +1256,24 @@ client.on('interactionCreate', async (interaction) => {
                 } else if (action === 'split') {
                     console.log('Split action triggered for user:', ownerId, 'State:', state);
 
+                    // Additional validation for split
+                    if (!state.player || state.player.length !== 2) {
+                        console.error('Invalid state for split - player should have exactly 2 cards');
+                        try { await interaction.followUp({ content: 'Invalid game state for split. Please start a new game.', ephemeral: true }); } catch {}
+                        bjGames.delete(ownerId);
+                        return;
+                    }
+
                     if (!bjCanSplit(state)) {
                         try { await interaction.followUp({ content: 'Cannot split these cards. Cards must be the same rank (e.g., 8-8, J-Q, 10-K).', ephemeral: true }); } catch {}
                         return;
                     }
 
-                    const bal = await getUserBalance(ownerId);
-                    if (bal < state.bet) {
+                const bal = await getUserBalance(ownerId);
+                if (bal < state.bet) {
                         try { await interaction.followUp({ content: `Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {}
-                        return;
-                    }
+                    return;
+                }
 
                     try {
                         await changeUserBalance(ownerId, interaction.user.username, -state.bet, 'blackjack_split_bet', { bet: state.bet });
@@ -1236,8 +1311,8 @@ client.on('interactionCreate', async (interaction) => {
                 }
                 return;
             }
-            } catch (e) {
-                console.error('Blackjack button error:', e);
+        } catch (e) {
+            console.error('Blackjack button error:', e);
                 try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
             }
         } catch (error) {
@@ -1268,14 +1343,14 @@ client.on('interactionCreate', async (interaction) => {
             db.get('SELECT COUNT(*) + 1 as rank FROM vouch_points WHERE points > ?', [points], (err2, rankRow) => {
                 const rank = rankRow ? rankRow.rank : 'Unranked';
                 
-                const embed = new EmbedBuilder()
+            const embed = new EmbedBuilder()
                     .setColor(points > 0 ? '#00ff00' : '#0099ff')
                     .setTitle(`💰 ${isOwnPoints ? 'Your' : displayName + "'s"} Vouch Points`)
                     .setDescription(
                         `${isOwnPoints ? 'You have' : `${displayName} has`} **${pointsFormatted}** vouch points!\n` +
                         `🏆 Server Rank: **#${rank}**`
                     )
-                    .setThumbnail(targetUser.displayAvatarURL())
+                .setThumbnail(targetUser.displayAvatarURL())
                     .setTimestamp()
                     .setFooter({ 
                         text: isOwnPoints ? 'Keep posting pictures to earn more points!' : 'Use /vouchpoints to check your own points'
@@ -1289,8 +1364,8 @@ client.on('interactionCreate', async (interaction) => {
                         inline: false
                     });
                 }
-                
-                interaction.reply({ embeds: [embed] });
+            
+            interaction.reply({ embeds: [embed] });
             });
         });
     }
@@ -1894,7 +1969,7 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await updateLiveLeaderboard(interaction.client);
             await interaction.editReply('✅ Live leaderboard has been updated in the #leaderboard channel!');
-        } catch (error) {
+    } catch (error) {
             console.error('Manual leaderboard update error:', error);
             await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
         }
