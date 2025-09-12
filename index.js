@@ -660,6 +660,106 @@ client.once('ready', async () => {
     }, 30 * 60 * 1000); // 30 minutes
 
     console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
+
+    // Register slash commands
+    const commands = [
+        {
+            name: 'vouchpoints',
+            description: 'Check your or someone else\'s vouch points',
+            options: [
+                {
+                    name: 'user',
+                    description: 'The user to check vouch points for',
+                    type: 6,
+                    required: false
+                }
+            ]
+        },
+        { name: 'leaderboard', description: 'View the vouch points leaderboard' },
+        { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
+        {
+            name: 'updateleaderboard',
+            description: 'Admin: Force update the live leaderboard in #leaderboard channel',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false
+        },
+        {
+            name: 'blackjack',
+            description: 'Play blackjack against the dealer',
+            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
+        },
+        {
+            name: 'roulette',
+            description: 'Spin the roulette wheel',
+            options: [
+                { name: 'type', description: 'Bet type (red, black, even, odd, low, high, number)', type: 3, required: true },
+                { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true },
+                { name: 'number', description: 'Number (0-36) required for type=number', type: 4, required: false }
+            ]
+        },
+        {
+            name: 'slots',
+            description: 'Pull the lever on slots',
+            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
+        },
+        {
+            name: 'recountvouches',
+            description: 'Admin: Recount all vouches in vouch channels and rebuild points',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                { name: 'channel', description: 'Specific vouch channel to scan (optional)', type: 7, required: false }
+            ]
+        },
+        {
+            name: 'addpoints',
+            description: 'Admin: Add points to a user',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                { name: 'user', description: 'User to modify', type: 6, required: true },
+                { name: 'amount', description: 'Amount to add', type: 4, required: true }
+            ]
+        },
+        {
+            name: 'removepoints',
+            description: 'Admin: Remove points from a user',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                { name: 'user', description: 'User to modify', type: 6, required: true },
+                { name: 'amount', description: 'Amount to remove', type: 4, required: true }
+            ]
+        },
+        {
+            name: 'setmultiplier',
+            description: 'Admin: Set global vouch multiplier (e.g., 2 for 2x)',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                { name: 'value', description: 'Multiplier value (>=1)', type: 10, required: true },
+                { name: 'duration_minutes', description: 'Duration in minutes (optional)', type: 4, required: false }
+            ]
+        },
+        { name: 'multiplierstatus', description: 'Show current vouch multiplier' },
+        { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false },
+        {
+            name: 'wipevouches',
+            description: 'Admin: Wipe all vouch points (irreversible)',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [ { name: 'confirm', description: 'Type "yes" to confirm', type: 3, required: true } ]
+        }
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    try {
+        console.log('🔄 Started refreshing application (/) commands.');
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('✅ Successfully reloaded application (/) commands.');
+    } catch (error) {
+        console.error('❌ Error registering commands:', error);
+    }
 });
 
 // Message event handler
@@ -966,14 +1066,15 @@ client.on('interactionCreate', async (interaction) => {
             } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
             }
-        } catch (e) {
-            console.error('Blackjack button error:', e);
+            } catch (e) {
+                console.error('Blackjack button error:', e);
                 try { await interaction.followUp({ content: '❌ Error processing action.', ephemeral: true }); } catch {}
+            }
+        } catch (error) {
+            console.error('Button interaction error:', error);
+            try { await interaction.followUp({ content: '❌ An unexpected error occurred. Please try again.', ephemeral: true }); } catch {}
         }
         return;
-    } catch (error) {
-        console.error('Button interaction error:', error);
-        try { await interaction.followUp({ content: '❌ An unexpected error occurred. Please try again.', ephemeral: true }); } catch {}
     }
 
     if (!interaction.isChatInputCommand()) return;
@@ -1568,107 +1669,6 @@ client.on('interactionCreate', async (interaction) => {
             console.error('Manual leaderboard update error:', error);
             await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
         }
-    }
-
-// Register slash commands when bot starts
-client.once('ready', async () => {
-    const commands = [
-        {
-            name: 'vouchpoints',
-            description: 'Check your or someone else\'s vouch points',
-            options: [
-                {
-                    name: 'user',
-                    description: 'The user to check vouch points for',
-                    type: 6,
-                    required: false
-                }
-            ]
-        },
-        { name: 'leaderboard', description: 'View the vouch points leaderboard' },
-        { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
-        {
-            name: 'updateleaderboard',
-            description: 'Admin: Force update the live leaderboard in #leaderboard channel',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false
-        },
-        {
-            name: 'blackjack',
-            description: 'Play blackjack against the dealer',
-            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
-        },
-        {
-            name: 'roulette',
-            description: 'Spin the roulette wheel',
-            options: [
-                { name: 'type', description: 'Bet type (red, black, even, odd, low, high, number)', type: 3, required: true },
-                { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true },
-                { name: 'number', description: 'Number (0-36) required for type=number', type: 4, required: false }
-            ]
-        },
-        {
-            name: 'slots',
-            description: 'Pull the lever on slots',
-            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
-        },
-        {
-            name: 'recountvouches',
-            description: 'Admin: Recount all vouches in vouch channels and rebuild points',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
-            options: [
-                { name: 'channel', description: 'Specific vouch channel to scan (optional)', type: 7, required: false }
-            ]
-        },
-        {
-            name: 'addpoints',
-            description: 'Admin: Add points to a user',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
-            options: [
-                { name: 'user', description: 'User to modify', type: 6, required: true },
-                { name: 'amount', description: 'Amount to add', type: 4, required: true }
-            ]
-        },
-        {
-            name: 'removepoints',
-            description: 'Admin: Remove points from a user',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
-            options: [
-                { name: 'user', description: 'User to modify', type: 6, required: true },
-                { name: 'amount', description: 'Amount to remove', type: 4, required: true }
-            ]
-        },
-        {
-            name: 'setmultiplier',
-            description: 'Admin: Set global vouch multiplier (e.g., 2 for 2x)',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
-            options: [
-                { name: 'value', description: 'Multiplier value (>=1)', type: 10, required: true },
-                { name: 'duration_minutes', description: 'Duration in minutes (optional)', type: 4, required: false }
-            ]
-        },
-        { name: 'multiplierstatus', description: 'Show current vouch multiplier' },
-        { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false },
-        {
-            name: 'wipevouches',
-            description: 'Admin: Wipe all vouch points (irreversible)',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
-            options: [ { name: 'confirm', description: 'Type "yes" to confirm', type: 3, required: true } ]
-        }
-    ];
-
-    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    try {
-        console.log('🔄 Started refreshing application (/) commands.');
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('✅ Successfully reloaded application (/) commands.');
-    } catch (error) {
-        console.error('❌ Error registering commands:', error);
     }
 });
 
