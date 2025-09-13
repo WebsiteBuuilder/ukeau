@@ -333,6 +333,72 @@ async function updateGame(interaction, state, payload) {
     await editGameMessage(state, payload);
 }
 
+// Attempt to disable all buttons on a stale interaction message
+async function disableStaleInteractionComponents(interaction) {
+    try {
+        const message = interaction?.message;
+        const comps = message?.components;
+        if (!message || !Array.isArray(comps) || comps.length === 0) return;
+        const disabled = comps.map(row => ({
+            type: 1,
+            components: row.components?.map(btn => ({
+                ...btn,
+                disabled: true
+            })) || []
+        }));
+        if (message.edit) {
+            await message.edit({ components: disabled }).catch(() => {});
+        } else if (interaction.update) {
+            await interaction.update({ components: disabled }).catch(() => {});
+        }
+    } catch {}
+}
+
+// Refund most recent unsettled blackjack bet if present (used when state missing)
+async function refundLastUnsettledBlackjackBet(userId) {
+    try {
+        const lastBet = await new Promise((resolve, reject) => {
+            db.get(
+                `SELECT timestamp, delta, meta FROM ledger
+                 WHERE user_id = ? AND reason = 'blackjack_bet'
+                 ORDER BY timestamp DESC
+                 LIMIT 1`,
+                [userId],
+                (err, row) => err ? reject(err) : resolve(row)
+            );
+        });
+        if (!lastBet) return false;
+
+        const afterCount = await new Promise((resolve, reject) => {
+            db.get(
+                `SELECT COUNT(*) AS c FROM ledger
+                 WHERE user_id = ? AND timestamp >= ? AND (
+                    reason LIKE 'blackjack_payout%' OR
+                    reason LIKE 'blackjack_split_payout%' OR
+                    reason LIKE 'blackjack_refund_%' OR
+                    reason = 'blackjack_settled'
+                 )`,
+                [userId, lastBet.timestamp],
+                (err, row) => err ? reject(err) : resolve(row?.c || 0)
+            );
+        });
+        if (afterCount > 0) return false; // already settled/refunded
+
+        let amount = Math.abs(Number(lastBet.delta || 0));
+        try {
+            const meta = JSON.parse(lastBet.meta || '{}');
+            if (meta && typeof meta.bet === 'number') amount = meta.bet;
+        } catch {}
+
+        if (!amount || amount <= 0) return false;
+        await changeUserBalance(userId, 'unknown', amount, 'blackjack_refund_no_active', { amount });
+        return true;
+    } catch (e) {
+        console.error('refundLastUnsettledBlackjackBet error:', e);
+        return false;
+    }
+}
+
 // =============== NEW BLACKJACK (Player-friendly) ===============
 function bjCreateShoe(numDecks = 4) {
     const deck = [];
@@ -1284,8 +1350,15 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
             if (!state) {
-                console.log('No active game found for user:', ownerId);
-                try { await interaction.followUp({ content: 'No active game found. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                console.log('No active game found for user:', ownerId, '- attempting refund and disabling stale controls');
+                // Disable buttons on the stale message to prevent further clicks
+                await disableStaleInteractionComponents(interaction);
+                // Attempt to refund the last unsettled blackjack bet if any
+                const refunded = await refundLastUnsettledBlackjackBet(ownerId);
+                const msg = refunded
+                    ? 'No active game found. Your last blackjack bet has been refunded. Use `/blackjack` to start a new game.'
+                    : 'No active game found. Use `/blackjack` to start a new game.';
+                try { await interaction.followUp({ content: msg, ephemeral: true }); } catch {}
                 return;
             }
             if (state.ended) { 
@@ -1358,14 +1431,14 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     } else {
                         state.player.push(bjDraw(state));
-                        const pv = handValue(state.player);
-                        if (pv >= 21) {
+                    const pv = handValue(state.player);
+                    if (pv >= 21) {
                             await bjResolve(interaction, state, 'stand');
-                        } else {
+                    } else {
                             await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 You hit.' }, interaction);
-                        }
                     }
-                } else if (action === 'stand') {
+                }
+            } else if (action === 'stand') {
                     if (state.split && state.currentSplitHand === 1) {
                         // Move to second hand
                         state.currentSplitHand = 2;
@@ -1373,7 +1446,7 @@ client.on('interactionCreate', async (interaction) => {
                     } else {
                         await bjResolve(interaction, state, 'stand');
                     }
-                } else if (action === 'double') {
+            } else if (action === 'double') {
                     if (!bjCanDouble(state)) { try { await interaction.followUp({ content: 'Cannot double now.', ephemeral: true }); } catch {} return; }
                     const bal = await getUserBalance(ownerId);
                     if (bal < state.bet) { try { await interaction.followUp({ content: 'Not enough points to double.', ephemeral: true }); } catch {} return; }
@@ -1400,12 +1473,12 @@ client.on('interactionCreate', async (interaction) => {
                         return;
                     }
 
-                    const bal = await getUserBalance(ownerId);
-                    if (bal < state.bet) {
+                const bal = await getUserBalance(ownerId);
+                if (bal < state.bet) {
                         console.log('❌ Insufficient balance for split for user:', ownerId);
                         try { await interaction.followUp({ content: `❌ Not enough points to split. Need ${state.bet} more points.`, ephemeral: true }); } catch {}
-                        return;
-                    }
+                    return;
+                }
 
                     try {
                         console.log('✅ Processing split bet deduction for user:', ownerId);
@@ -1433,7 +1506,7 @@ client.on('interactionCreate', async (interaction) => {
                         // Clean up corrupted game state
                         bjGames.delete(ownerId);
                     }
-                } else if (action === 'surrender') {
+            } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
                 } else if (action === 'newgame') {
                     // Start a new game - redirect to blackjack command
@@ -1446,20 +1519,24 @@ client.on('interactionCreate', async (interaction) => {
                         console.error('New game message failed:', e);
                     }
                     return;
-                }
-            } catch (e) {
-                console.error('❌ Blackjack button error for user', ownerId, ':', e);
-                // Attempt to refund if there's a valid game state
-                const gameState = bjGames.get(ownerId);
-                if (gameState && !gameState.ended) {
-                    await refundBlackjackBet(gameState, 'action_error');
-                    bjGames.delete(ownerId);
-                }
-                try { await interaction.followUp({ content: '❌ Error processing action. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
             }
+        } catch (e) {
+            console.error('❌ Blackjack button error for user', ownerId, ':', e);
+            // Attempt to refund if there's a valid game state
+            const gameState = bjGames.get(ownerId);
+            if (gameState && !gameState.ended) {
+                await refundBlackjackBet(gameState, 'action_error');
+                bjGames.delete(ownerId);
+            }
+            // Disable stale components so users don't keep clicking dead buttons
+            await disableStaleInteractionComponents(interaction);
+            try { await interaction.followUp({ content: '❌ Error processing action. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
+        }
         } catch (error) {
             console.error('Button interaction error:', error);
-            try { await interaction.followUp({ content: '❌ An unexpected error occurred. Please try again.', ephemeral: true }); } catch {}
+            // Best-effort disable of stale buttons
+            await disableStaleInteractionComponents(interaction);
+            try { await interaction.followUp({ content: '❌ An unexpected error occurred. If your bet was placed, it has been refunded.', ephemeral: true }); } catch {}
         }
         return;
     }
@@ -2236,7 +2313,7 @@ client.on('interactionCreate', async (interaction) => {
 
             await interaction.editReply(response);
 
-        } catch (error) {
+    } catch (error) {
             console.error('Transactions query error:', error);
             await interaction.editReply('❌ Error retrieving transactions.');
         }
