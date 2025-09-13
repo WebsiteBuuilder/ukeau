@@ -752,10 +752,11 @@ async function bjResolveSplit(interaction, state, action, fromTimeout = false) {
         let payout = 0;
         
         if (pv > 21) outcome = 'bust';
-        else if (dv > 21) { outcome = 'win'; payout = state.bet; }
-        else if (pv > dv) { outcome = 'win'; payout = state.bet; }
+        else if (dv > 21) { outcome = 'win'; payout = state.bet * 2; }
+        else if (pv > dv) { outcome = 'win'; payout = state.bet * 2; }
         else if (pv === dv) { outcome = 'push'; payout = state.bet; }
-        if (pv === 21 && hand.cards.length === 2) { outcome = 'blackjack'; payout = Math.floor(state.bet * 1.5); }
+        // Match single-hand bonus: two-card 21 gets 3x total payout (bet returned + 2x win)
+        if (pv === 21 && hand.cards.length === 2) { outcome = 'blackjack'; payout = Math.floor(state.bet * 3); }
         
         totalPayout += payout;
         results.push(`${hand.label}: ${handEmoji(hand.cards)} (${pv}) - ${outcome === 'win' ? '🎉 WIN' : outcome === 'push' ? '🤝 PUSH' : outcome === 'blackjack' ? '🃏 BLACKJACK' : '😔 LOSE'}`);
@@ -1329,13 +1330,14 @@ client.on('interactionCreate', async (interaction) => {
                     await interaction.deferUpdate();
                 } catch (deferError) {
                     console.error('Defer update failed:', deferError);
-                    // If defer fails, try to reply
+                    // If defer fails, try edit/update as a fallback to keep the interaction alive
                     try {
-                        await interaction.reply({ content: 'Processing your action...', ephemeral: true });
-                    } catch (replyError) {
-                        console.error('Reply failed too:', replyError);
-                        return; // Can't continue if both defer and reply fail
-                    }
+                        if (interaction.message && interaction.message.edit) {
+                            await interaction.message.edit({ components: interaction.message.components });
+                        } else if (interaction.update) {
+                            await interaction.update({ components: interaction.message?.components || [] });
+                        }
+                    } catch {}
                 }
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
@@ -1690,6 +1692,7 @@ client.on('interactionCreate', async (interaction) => {
                 } catch {}
             }
             // Ensure initial view drew; also try a second update via editReply to avoid any race
+            // Finalize view after controls were temporarily disabled during button processing
             await bjUpdateView(state, { hideDealerHole: true, note: '\nYour move: Hit, Stand, Double, or Surrender.' }, interaction);
 
             // Auto-timeout to stand after 30s (reasonable for user experience)
