@@ -847,9 +847,59 @@ client.once('ready', async () => {
             name: 'recountvouches',
             description: 'Admin: Recount all vouches in vouch channels and rebuild points',
             default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false,
+        },
+        {
+            name: 'sendpoints',
+            description: 'Send vouch points to another user',
+            dm_permission: true,
             options: [
-                { name: 'channel', description: 'Specific vouch channel to scan (optional)', type: 7, required: false }
+                {
+                    name: 'user',
+                    description: 'The user to send points to',
+                    type: 6, // USER type
+                    required: true
+                },
+                {
+                    name: 'amount',
+                    description: 'Amount of points to send (minimum 1)',
+                    type: 4, // INTEGER type
+                    required: true,
+                    min_value: 1
+                }
+            ]
+        },
+        {
+            name: 'balance',
+            description: 'Check your current vouch points balance',
+            dm_permission: true,
+            options: [
+                {
+                    name: 'user',
+                    description: 'Check another user\'s balance (optional)',
+                    type: 6, // USER type
+                    required: false
+                }
+            ]
+        },
+        {
+            name: 'transactions',
+            description: 'View your recent point transactions',
+            dm_permission: true,
+            options: [
+                {
+                    name: 'user',
+                    description: 'View another user\'s transactions (admin only)',
+                    type: 6,
+                    required: false
+                },
+                {
+                    name: 'limit',
+                    description: 'Number of transactions to show (max 20)',
+                    type: 4,
+                    required: false,
+                    min_value: 1,
+                    max_value: 20
+                }
             ]
         },
         {
@@ -2077,6 +2127,149 @@ client.on('interactionCreate', async (interaction) => {
     } catch (error) {
             console.error('Manual leaderboard update error:', error);
             await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
+        }
+    }
+
+    // Handle /sendpoints command
+    if (interaction.commandName === 'sendpoints') {
+        const targetUser = interaction.options.getUser('user');
+        const amount = interaction.options.getInteger('amount');
+
+        if (!targetUser) {
+            interaction.reply({ content: '❌ Invalid target user.', ephemeral: true });
+            return;
+        }
+
+        if (targetUser.id === interaction.user.id) {
+            interaction.reply({ content: '❌ You cannot send points to yourself.', ephemeral: true });
+            return;
+        }
+
+        if (targetUser.bot) {
+            interaction.reply({ content: '❌ You cannot send points to bots.', ephemeral: true });
+            return;
+        }
+
+        if (amount < 1) {
+            interaction.reply({ content: '❌ Amount must be at least 1.', ephemeral: true });
+            return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            // Check sender's balance
+            const senderBalance = await getUserBalance(interaction.user.id);
+            if (senderBalance < amount) {
+                await interaction.editReply(`❌ Insufficient balance. You have ${senderBalance} points but need ${amount}.`);
+                return;
+            }
+
+            // Perform the transfer
+            await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'transfer_sent', {
+                recipientId: targetUser.id,
+                recipientUsername: targetUser.username,
+                amount: amount
+            });
+
+            await changeUserBalance(targetUser.id, targetUser.username, amount, 'transfer_received', {
+                senderId: interaction.user.id,
+                senderUsername: interaction.user.username,
+                amount: amount
+            });
+
+            await interaction.editReply(`✅ Successfully sent ${amount} points to ${targetUser.username}!`);
+
+        } catch (error) {
+            console.error('Transfer error:', error);
+            await interaction.editReply('❌ Error processing transfer. Please try again.');
+        }
+    }
+
+    // Handle /balance command
+    if (interaction.commandName === 'balance') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+
+        try {
+            const balance = await getUserBalance(targetUser.id);
+
+            if (targetUser.id === interaction.user.id) {
+                await interaction.reply(`💰 Your current balance: **${balance}** vouch points`);
+            } else {
+                await interaction.reply(`💰 ${targetUser.username}'s balance: **${balance}** vouch points`);
+            }
+
+        } catch (error) {
+            console.error('Balance check error:', error);
+            await interaction.reply({ content: '❌ Error checking balance.', ephemeral: true });
+        }
+    }
+
+    // Handle /transactions command
+    if (interaction.commandName === 'transactions') {
+        const targetUser = interaction.options.getUser('user') || interaction.user;
+        const limit = interaction.options.getInteger('limit') || 10;
+
+        // Check permissions for viewing other users' transactions
+        if (targetUser.id !== interaction.user.id) {
+            const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+            if (!isAdmin) {
+                await interaction.reply({ content: '❌ You can only view your own transactions.', ephemeral: true });
+                return;
+            }
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            const transactions = await new Promise((resolve, reject) => {
+                db.all(
+                    `SELECT delta, reason, meta, timestamp FROM ledger
+                     WHERE user_id = ?
+                     ORDER BY timestamp DESC
+                     LIMIT ?`,
+                    [targetUser.id, limit],
+                    (err, rows) => {
+                        if (err) reject(err);
+                        else resolve(rows);
+                    }
+                );
+            });
+
+            if (transactions.length === 0) {
+                await interaction.editReply(`📊 No transactions found for ${targetUser.username}.`);
+                return;
+            }
+
+            let response = `📊 **Recent Transactions for ${targetUser.username}:**\n\n`;
+
+            for (const tx of transactions) {
+                const timestamp = new Date(tx.timestamp).toLocaleString();
+                const delta = tx.delta > 0 ? `+${tx.delta}` : tx.delta;
+                const reason = tx.reason.replace(/_/g, ' ').toUpperCase();
+
+                response += `**${timestamp}**\n`;
+                response += `• ${reason}: ${delta} points\n`;
+
+                // Add additional details for transfers
+                if (tx.reason.includes('transfer')) {
+                    try {
+                        const meta = JSON.parse(tx.meta || '{}');
+                        if (meta.senderUsername || meta.recipientUsername) {
+                            const otherUser = meta.senderUsername || meta.recipientUsername;
+                            response += `  └─ ${otherUser}\n`;
+                        }
+                    } catch (e) {}
+                }
+
+                response += '\n';
+            }
+
+            await interaction.editReply(response);
+
+        } catch (error) {
+            console.error('Transactions query error:', error);
+            await interaction.editReply('❌ Error retrieving transactions.');
         }
     }
 });
