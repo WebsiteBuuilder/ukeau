@@ -869,19 +869,6 @@ client.once('ready', async () => {
             ]
         },
         {
-            name: 'balance',
-            description: 'Check your current vouch points balance',
-            dm_permission: true,
-            options: [
-                {
-                    name: 'user',
-                    description: 'Check another user\'s balance (optional)',
-                    type: 6, // USER type
-                    required: false
-                }
-            ]
-        },
-        {
             name: 'transactions',
             description: 'View your recent point transactions',
             dm_permission: true,
@@ -2186,24 +2173,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // Handle /balance command
-    if (interaction.commandName === 'balance') {
-        const targetUser = interaction.options.getUser('user') || interaction.user;
-
-        try {
-            const balance = await getUserBalance(targetUser.id);
-
-            if (targetUser.id === interaction.user.id) {
-                await interaction.reply(`💰 Your current balance: **${balance}** vouch points`);
-            } else {
-                await interaction.reply(`💰 ${targetUser.username}'s balance: **${balance}** vouch points`);
-            }
-
-        } catch (error) {
-            console.error('Balance check error:', error);
-            await interaction.reply({ content: '❌ Error checking balance.', ephemeral: true });
-        }
-    }
 
     // Handle /transactions command
     if (interaction.commandName === 'transactions') {
