@@ -134,6 +134,86 @@ async function getMultiplierExpiryMs() {
     return Number.isFinite(n) ? n : 0;
 }
 
+// Progressive Jackpot helpers for Slots
+const SLOTS_JACKPOT_SEED = 40; // Minimum reseed amount
+const SLOTS_JACKPOT_CONTRIB_RATE = 0.06; // 6% of stake goes to jackpot
+
+async function getIntegerSetting(key, defaultValue) {
+    const raw = await getSetting(key, String(defaultValue));
+    const n = Number(raw);
+    return Number.isFinite(n) ? Math.floor(n) : defaultValue;
+}
+
+async function getSlotsJackpot() {
+    const val = await getIntegerSetting('slots_jackpot', SLOTS_JACKPOT_SEED);
+    return Math.max(SLOTS_JACKPOT_SEED, val);
+}
+
+async function setSlotsJackpot(value) {
+    const v = Math.max(SLOTS_JACKPOT_SEED, Math.floor(Number(value) || 0));
+    await setSetting('slots_jackpot', String(v));
+    return v;
+}
+
+async function addToSlotsJackpot(stakeAmount) {
+    try {
+        const current = await getSlotsJackpot();
+        const add = Math.max(0, Math.floor(stakeAmount * SLOTS_JACKPOT_CONTRIB_RATE));
+        const next = current + add;
+        await setSlotsJackpot(next);
+        return next;
+    } catch (e) {
+        console.error('addToSlotsJackpot error:', e);
+        return null;
+    }
+}
+
+async function maybeHitSlotsJackpot(userId, username, stake) {
+    try {
+        // Hit chance scales lightly with stake but stays small
+        const base = 0.0008; // ~1 in 1250
+        const scaled = Math.min(0.01, base + Math.min(stake, 1000) * 0.000001); // +0.000001 per stake up to +0.001
+        const r = Math.random();
+        if (r < scaled) {
+            const jackpot = await getSlotsJackpot();
+            if (jackpot > 0) {
+                await changeUserBalance(userId, username, jackpot, 'slots_jackpot_payout', { jackpot, stake });
+                await setSlotsJackpot(SLOTS_JACKPOT_SEED);
+                return jackpot;
+            }
+        }
+    } catch (e) {
+        console.error('maybeHitSlotsJackpot error:', e);
+    }
+    return 0;
+}
+
+// Fractional payout carry for slots (to allow small payouts like 0.20)
+async function getFractionalCarry(userId) {
+    const raw = await getSetting(`frac_carry_${userId}`, '0');
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+}
+
+async function setFractionalCarry(userId, value) {
+    const v = Math.max(0, Number(value) || 0);
+    await setSetting(`frac_carry_${userId}`, String(v));
+}
+
+async function creditWithFraction(userId, username, amountFloat, reason, meta) {
+    const safeAmount = Math.max(0, Number(amountFloat) || 0);
+    if (safeAmount <= 0) return 0;
+    const carry = await getFractionalCarry(userId);
+    const total = carry + safeAmount;
+    const whole = Math.floor(total);
+    const remainder = Number((total - whole).toFixed(4));
+    if (whole > 0) {
+        await changeUserBalance(userId, username, whole, reason, { ...meta, payoutFloat: safeAmount, carryUsed: carry, carryRemainder: remainder });
+    }
+    await setFractionalCarry(userId, remainder);
+    return whole;
+}
+
 async function setMultiplierExpiryMs(ms) {
     await setSetting('multiplier_expires_at', String(ms || 0));
 }
@@ -451,6 +531,11 @@ function bjBuildEmbed(state, opts = {}) {
         winnerInfo = '💎 NO WINNERS YET TODAY';
     }
 
+    // Precompute header text (inject jackpot if provided)
+    const headerText = (opts && Object.prototype.hasOwnProperty.call(opts, 'jackpot'))
+        ? `${winnerInfo} • 💰 Jackpot: ${opts.jackpot}`
+        : `${winnerInfo}`;
+
     // Handle split hands with glassmorphism pill badges
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
     const playerLines = playerHands.map((hand, idx) => {
@@ -481,7 +566,7 @@ function bjBuildEmbed(state, opts = {}) {
     const table = [
         '╔════════════════════════════════════════════════════════════════════════════════╗',
         '║                        🎰 PREMIUM BLACKJACK CASINO 🎰                         ║',
-        `║                      ${winnerInfo.padEnd(54,' ')} ║`,
+        `║ ${headerText.padEnd(78,' ')} ║`,
         '╠════════════════════════════════════════════════════════════════════════════════╣',
         '║                                                                                ║',
         `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
@@ -587,6 +672,10 @@ async function bjUpdateView(state, opts = {}, interaction = null) {
     if (!opts.topWinner) {
         const topWinner = await get24HourTopWinner();
         opts.topWinner = topWinner;
+    }
+    // Pass jackpot for header display
+    if (!Object.prototype.hasOwnProperty.call(opts, 'jackpot')) {
+        try { opts.jackpot = await getSlotsJackpot(); } catch {}
     }
     const embed = bjBuildEmbed(state, opts);
     await updateGame(interaction, state, { embeds: [embed], components: bjComponents(state) });
@@ -908,7 +997,11 @@ client.once('ready', async () => {
         {
             name: 'slots',
             description: 'Pull the lever on slots',
-            options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
+            options: [
+                { name: 'amount', description: 'Total bet amount (>=1)', type: 4, required: true },
+                { name: 'lines', description: 'Number of paylines (1-20)', type: 4, required: false, min_value: 1, max_value: 20 },
+                { name: 'machine', description: 'Slot machine theme (classic, fruits, gems)', type: 3, required: false }
+            ]
         },
         {
             name: 'recountvouches',
@@ -954,6 +1047,15 @@ client.once('ready', async () => {
                     min_value: 1,
                     max_value: 20
                 }
+            ]
+        },
+        {
+            name: 'pay',
+            description: 'Send vouch points to another player (alias of /sendpoints)',
+            dm_permission: true,
+            options: [
+                { name: 'user', description: 'The user to send points to', type: 6, required: true },
+                { name: 'amount', description: 'Amount of points to send (minimum 1)', type: 4, required: true, min_value: 1 }
             ]
         },
         {
@@ -1123,8 +1225,8 @@ async function get24HourTopWinner() {
                 COALESCE(v.username, 'Unknown') as username
             FROM ledger l
             LEFT JOIN vouch_points v ON l.user_id = v.user_id
-            WHERE l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%'
-            AND l.created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+            WHERE (l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%')
+              AND l.created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
             GROUP BY l.user_id
             ORDER BY net_wins DESC
             LIMIT 1
@@ -1666,7 +1768,8 @@ client.on('interactionCreate', async (interaction) => {
             const initialEmbed = bjBuildEmbed(state, {
                 hideDealerHole: true,
                 note: '\nYour move: Hit, Stand, Double, or Surrender.',
-                topWinner: topWinner
+                topWinner: topWinner,
+                jackpot: await getSlotsJackpot()
             });
             const components = [
                 {
@@ -1806,7 +1909,7 @@ client.on('interactionCreate', async (interaction) => {
 ║                                      ║
 ║     ${win>0 ? '💰 WINNER! 💰' : '😤 BETTER LUCK NEXT TIME'}      ║
 ║                                      ║
-║   🎲 24H TOP WINNER FEATURE 🎲     ║
+║   🎲 24H TOP WINNER • 💰 JACKPOT: ${await getSlotsJackpot()}  ║
 ╚══════════════════════════════════════╝`;
             const net = win - amount;
             const breakdown = `\nBet: ${amount} • Payout: ${win} • Net: ${net>=0?'+':''}${net}`;
@@ -1833,64 +1936,191 @@ client.on('interactionCreate', async (interaction) => {
             if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
             const cd = onCooldown('slots:' + interaction.user.id, SLOTS_COOLDOWN_MS);
             if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
-            const amount = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
+            const requestedAmount = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
             const balance = await getUserBalance(interaction.user.id);
-            if (amount <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
-            if (balance < amount) { await interaction.reply({ content: 'Insufficient points.', ephemeral: true }); return; }
-            await changeUserBalance(interaction.user.id, interaction.user.username, -amount, 'slots_bet', { bet: amount });
-            setCooldown('slots:' + interaction.user.id);
+            if (requestedAmount <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
+            if (balance < requestedAmount) { await interaction.reply({ content: 'Insufficient points.', ephemeral: true }); return; }
 
-            const symbols = ['🍒','🍋','💎','🔔','7️⃣','🃏'];
-            const weights = [30, 25, 15, 15, 10, 5]; // sum=100; 🃏 is rare
-            function spin() {
-                const roll = () => {
-                    let r = Math.random() * 100, acc = 0;
-                    for (let i = 0; i < symbols.length; i++) { acc += weights[i]; if (r <= acc) return symbols[i]; }
-                    return symbols[0];
-                };
-                return [roll(), roll(), roll()];
+            // Optional options (backward compatible if not registered)
+            const requestedLines = Math.max(1, Math.min(20, Math.floor(interaction.options.getInteger?.('lines') || 0) || 0)) || 10; // default 10
+            const machineKey = (interaction.options.getString?.('machine') || 'classic').toLowerCase();
+
+            // Determine active lines and per-line bet ensuring >=1 per line
+            let lines = Math.max(1, Math.min(20, requestedLines));
+            lines = Math.min(lines, requestedAmount); // ensure at least 1 per line
+            let lineBet = Math.floor(requestedAmount / lines);
+            if (lineBet < 1) { lineBet = 1; lines = Math.min(requestedAmount, lines); }
+            const stake = lines * lineBet;
+
+            // Deduct only the effective stake, not the raw requested amount
+            await changeUserBalance(interaction.user.id, interaction.user.username, -stake, 'slots_bet', {
+                requestedAmount,
+                stake,
+                lines,
+                lineBet,
+                machine: machineKey
+            });
+            setCooldown('slots:' + interaction.user.id);
+            // If requested was higher than stake (due to line division), refund the difference immediately
+            const changeBack = requestedAmount - stake;
+            if (changeBack > 0) {
+                await changeUserBalance(interaction.user.id, interaction.user.username, changeBack, 'slots_bet_change_return', {
+                    requestedAmount,
+                    stake,
+                    changeBack
+                });
             }
 
-            // Slots immersive frames
-            const frameBase = (line) => `
-╔══════════════════════════════════════╗
-║         💎 DIAMOND SLOT™ 💎          ║
-║       VIP-ONLY — HIGH LIMITS         ║
-║--------------------------------------║
-║           ${line}           ║
-║--------------------------------------║
-║  🎉 Exclusive jackpots in this server only! 🎉  ║
-╚══════════════════════════════════════╝`;
-            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription(frameBase('🌀 🌀 🌀')).setFooter({ text: '🎰 Spinning…' }) ] });
-            await new Promise(r => setTimeout(r, 500));
-            await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription(frameBase('🍒 🌀 🌀')).setFooter({ text: '🎰 Reels stopping…' }) ] });
-            await new Promise(r => setTimeout(r, 500));
-            const [a,b,c] = spin();
-            let payout = 0;
-            if (a === b && b === c) payout = amount * 10;
-            else if (a === b || b === c || a === c) payout = amount * 2;
-            const line = `${a} ${b} ${c}`;
+            // Machine configurations
+            function getMachineConfig(key) {
+                switch (key) {
+                    case 'gems':
+                        return {
+                            symbols: ['💠','🔷','🔶','🔺','💎','7️⃣'],
+                            weights: [24,22,20,16,12,6],
+                            paytable: {
+                                '💠': { 3: 4, 4: 10, 5: 25 },
+                                '🔷': { 3: 5, 4: 12, 5: 30 },
+                                '🔶': { 3: 6, 4: 14, 5: 35 },
+                                '🔺': { 3: 8, 4: 18, 5: 45 },
+                                '💎': { 3: 20, 4: 60, 5: 180 },
+                                '7️⃣': { 3: 25, 4: 80, 5: 220 }
+                            }
+                        };
+                    case 'fruits':
+                        return {
+                            symbols: ['🍒','🍋','🍊','🍉','🔔','7️⃣'],
+                            weights: [26,22,20,16,10,6],
+                            paytable: {
+                                '🍒': { 3: 4, 4: 10, 5: 25 },
+                                '🍋': { 3: 5, 4: 12, 5: 30 },
+                                '🍊': { 3: 6, 4: 14, 5: 35 },
+                                '🍉': { 3: 8, 4: 18, 5: 45 },
+                                '🔔': { 3: 12, 4: 28, 5: 70 },
+                                '7️⃣': { 3: 20, 4: 60, 5: 180 }
+                            }
+                        };
+                    default:
+                        return {
+                            symbols: ['🍒','🍋','🍊','🔔','⭐','7️⃣','💎'],
+                            weights: [24,20,18,14,12,8,4],
+                            paytable: {
+                                '🍒': { 3: 4, 4: 10, 5: 25 },
+                                '🍋': { 3: 5, 4: 12, 5: 30 },
+                                '🍊': { 3: 6, 4: 14, 5: 35 },
+                                '🔔': { 3: 10, 4: 24, 5: 60 },
+                                '⭐': { 3: 12, 4: 30, 5: 75 },
+                                '7️⃣': { 3: 18, 4: 55, 5: 150 },
+                                '💎': { 3: 25, 4: 75, 5: 220 }
+                            }
+                        };
+                }
+            }
+
+            const machine = getMachineConfig(machineKey);
+            const totalWeight = machine.weights.reduce((a,b)=>a+b,0);
+            function rollSymbol() {
+                let r = Math.random() * totalWeight, acc = 0;
+                for (let i = 0; i < machine.symbols.length; i++) { acc += machine.weights[i]; if (r <= acc) return machine.symbols[i]; }
+                return machine.symbols[0];
+            }
+
+            // Build 5x3 grid (rows x cols)
+            const cols = 5, rows = 3;
+            const grid = Array.from({ length: rows }, () => Array.from({ length: cols }, () => rollSymbol()));
+
+            // Paylines (row indices per column)
+            const PAYLINES = [
+                [0,0,0,0,0], [1,1,1,1,1], [2,2,2,2,2],
+                [0,1,2,1,0], [2,1,0,1,2],
+                [0,0,1,0,0], [2,2,1,2,2],
+                [1,0,0,0,1], [1,2,2,2,1],
+                [0,1,1,1,0], [2,1,1,1,2],
+                [0,1,0,1,0], [2,1,2,1,2],
+                [1,0,1,2,1], [1,2,1,0,1]
+            ];
+
+            const activePaylines = PAYLINES.slice(0, Math.max(1, Math.min(lines, PAYLINES.length)));
+
+            function evaluateLine(lineIdx) {
+                const pattern = activePaylines[lineIdx];
+                const firstSymbol = grid[pattern[0]][0];
+                let count = 1;
+                for (let c = 1; c < cols; c++) {
+                    const r = pattern[c];
+                    if (grid[r][c] === firstSymbol) count++; else break;
+                }
+                // Allow tiny 2-of-a-kind payouts for low symbols on some machines
+                let mult = 0;
+                if (count >= 3) {
+                    mult = (machine.paytable[firstSymbol] || {})[count] || 0;
+                } else if (count === 2) {
+                    const low2Kind = new Set(['🍒','🍋','🍊','💠','🔷']);
+                    if (low2Kind.has(firstSymbol)) mult = 0.2; // fractional multiplier
+                }
+                if (!mult) return null;
+                return { symbol: firstSymbol, count, multiplier: mult, payout: mult * lineBet, line: pattern };
+            }
+
+            const wins = [];
+            for (let i = 0; i < activePaylines.length; i++) {
+                const w = evaluateLine(i);
+                if (w) wins.push({ index: i+1, ...w });
+            }
+            const totalPayout = wins.reduce((s,w)=>s + w.payout, 0);
+
+            // Progressive jackpot contribution and potential hit
+            const jackpotAfterStake = await addToSlotsJackpot(stake);
+            const jackpotHit = await maybeHitSlotsJackpot(interaction.user.id, interaction.user.username, stake);
+            const jackpotDisplay = jackpotHit > 0 ? `🎉 JACKPOT WON: ${jackpotHit}!` : `💰 Progressive Jackpot: ${await getSlotsJackpot()}`;
+
+            // Visuals
+            const rowToString = (r) => grid[r].join('  ');
+            const gridBox = `
+╔══════════════════════════════════════════════╗
+║              🎰 PREMIUM 5×3 SLOTS             ║
+║----------------------------------------------║
+║  ${rowToString(0)}  ║
+║  ${rowToString(1)}  ║
+║  ${rowToString(2)}  ║
+║----------------------------------------------║
+║  Lines: ${lines} • Bet/Line: ${lineBet} • Stake: ${stake}       ║
+╚══════════════════════════════════════════════╝`;
 
             // Get 24-hour top winner for display
             const topWinner = await get24HourTopWinner();
             const winnerDisplay = topWinner ? `🏆 ${topWinner.username || 'Unknown'} (+${topWinner.net_wins})` : '💎 GLASSMORPHISM THEME';
 
-            const resultBox = `
-╔══════════════════════════════════════╗
-║         💎 DIAMOND SLOT™ 💎          ║
-║        ${winnerDisplay}        ║
-║--------------------------------------║
-║           ${line}           ║
-║--------------------------------------║
-║ ${payout>0 ? '💰 JACKPOT! CLAIM YOUR VIP REWARDS 💰' : '😤 MISS! TRY THE VIP LUCK AGAIN'} ║
-║                                      ║
-║    🎰 24H TOP WINNER FEATURE 🎰     ║
-╚══════════════════════════════════════╝`;
-            const net = payout - amount;
-            const breakdown = `\nBet: ${amount} • Payout: ${payout} • Net: ${net>=0?'+':''}${net}`;
-            const embed = new EmbedBuilder().setColor(payout>0?'#00c853':'#c62828').setDescription(resultBox + breakdown).setFooter({ text: `Bet: ${amount} • 🎰 24h Top Winner • ⚡ Lightning Fast` });
+            let winsText = wins.length > 0 ? '' : 'No winning lines. Better luck next spin!';
+            if (wins.length > 0) {
+                for (const w of wins) {
+                    winsText += `Line ${w.index}: ${w.symbol} ×${w.count} → x${w.multiplier} = ${w.payout}\n`;
+                }
+            }
+
+            // Animate simple spin frames
+            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription('```\nSPINNING…\n```').setFooter({ text: '🎰 Spinning…' }) ] });
+            await new Promise(r => setTimeout(r, 350));
+            await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#7c4dff').setDescription('```\nREELS STOPPING…\n```').setFooter({ text: '🎰 Reels stopping…' }) ] });
+            await new Promise(r => setTimeout(r, 350));
+
+            const net = Number((totalPayout - stake).toFixed(2));
+            const summary = `\nMachine: ${machineKey} • ${winnerDisplay}\n${jackpotDisplay}\nTotal payout: ${totalPayout.toFixed(2)} • Net: ${net>=0?'+':''}${net.toFixed(2)}`;
+            const color = totalPayout > 0 ? '#00c853' : '#c62828';
+            const embed = new EmbedBuilder()
+                .setColor(color)
+                .setDescription(gridBox + '\n' + '```\n' + (winsText || '') + '```' + summary)
+                .setFooter({ text: `Stake: ${stake} • Lines: ${lines} • Bet/Line: ${lineBet}` });
             await interaction.editReply({ content: undefined, embeds: [embed] });
-            if (payout > 0) await changeUserBalance(interaction.user.id, interaction.user.username, payout, 'slots_payout', { a,b,c });
+
+            if (totalPayout > 0) await creditWithFraction(interaction.user.id, interaction.user.username, totalPayout, 'slots_payout', {
+                lines,
+                lineBet,
+                stake,
+                machine: machineKey,
+                grid,
+                wins
+            });
             // Balance after slots
             try { const bal = await getUserBalance(interaction.user.id); await interaction.followUp({ content: `Current balance: ${bal} vouch points.`, ephemeral: true }); } catch {}
 
@@ -2197,8 +2427,8 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    // Handle /sendpoints command
-    if (interaction.commandName === 'sendpoints') {
+    // Handle /sendpoints and /pay command (alias)
+    if (interaction.commandName === 'sendpoints' || interaction.commandName === 'pay') {
         const targetUser = interaction.options.getUser('user');
         const amount = interaction.options.getInteger('amount');
 
