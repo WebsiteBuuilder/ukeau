@@ -2635,7 +2635,5 @@ async function recoverGameState(userId) {
     return null;
 }
 
-const getSlotsJackpot = () => getSetting('slots_jackpot', 10000);
-const setSlotsJackpot = (v) => setSetting('slots_jackpot', Math.floor(v));
-
+// Duplicate jackpot helpers removed (async versions already defined above)
 
