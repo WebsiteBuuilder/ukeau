@@ -260,8 +260,7 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
     }, delay);
 }
 
-// Casino helpers
-const bjGames = new Map(); // userId -> state
+// Casino helpers (DB-backed; no in-memory bjGames)
 const activeCooldowns = new Map(); // key -> timestamp
 const BLACKJACK_COOLDOWN_MS = 3000;
 const ROULETTE_COOLDOWN_MS = 8000;
@@ -747,7 +746,7 @@ async function bjDealInitial(state) {
 async function bjResolve(interaction, state, action, fromTimeout = false) {
     if (state.ended) return;
     state.ended = true;
-    bjGames.delete(state.userId);
+    await deleteBlackjackGame(state.userId);
     
     // Handle split hands resolution
     if (state.split) {
@@ -908,60 +907,8 @@ client.once('ready', async () => {
     }, 30 * 60 * 1000); // 30 minutes
 
     // Set up game state cleanup (every 10 minutes - less aggressive)
-    setInterval(() => {
-        try {
-            let cleaned = 0;
-            const now = Date.now();
-            for (const [userId, state] of bjGames.entries()) {
-                const gameAge = now - state.startedAt;
-                const maxAge = state.split ? 20 * 60 * 1000 : 12 * 60 * 1000; // 20min for splits, 12min for regular
-
-                // Only clean up if truly corrupted or very old - with automatic refunds
-                if ((gameAge > maxAge && !state.ended) || !state.player || !Array.isArray(state.player) || state.player.length === 0) {
-                    // Refund bet if game was active and not ended
-                    if (!state.ended && gameAge > maxAge) {
-                        console.log(`💰 Refunding bet for timed-out game for user ${userId}`);
-                        // Use synchronous refund since we're in a cleanup interval
-                        try {
-                            const refundAmount = state.bet || 0;
-                            if (refundAmount > 0) {
-                                changeUserBalance(userId, 'unknown', refundAmount, 'blackjack_refund_cleanup_timeout', {
-                                    originalBet: refundAmount,
-                                    gameAge: Math.round(gameAge/60000),
-                                    reason: 'periodic_cleanup_timeout'
-                                });
-                            }
-                        } catch (refundError) {
-                            console.error('Failed to refund during cleanup:', refundError);
-                        }
-                    } else if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
-                        console.log(`💰 Refunding bet for corrupted game for user ${userId}`);
-                        // Use synchronous refund for corrupted games
-                        try {
-                            const refundAmount = state.bet || 0;
-                            if (refundAmount > 0) {
-                                changeUserBalance(userId, 'unknown', refundAmount, 'blackjack_refund_cleanup_corrupted', {
-                                    originalBet: refundAmount,
-                                    reason: 'periodic_cleanup_corrupted'
-                                });
-                            }
-                        } catch (refundError) {
-                            console.error('Failed to refund during cleanup:', refundError);
-                        }
-                    }
-
-                    bjGames.delete(userId);
-                    cleaned++;
-                    console.log(`🧹 Cleaned up game for user ${userId} (age: ${Math.round(gameAge/60000)}min, ended: ${state.ended}, refunded: ${state.bet || 0})`);
-                }
-            }
-            if (cleaned > 0) {
-                console.log(`🧹 Cleaned up ${cleaned} expired/frozen blackjack games`);
-            }
-        } catch (error) {
-            console.error('Game cleanup error:', error);
-        }
-    }, 10 * 60 * 1000); // 10 minutes - less frequent
+    // Legacy in-memory cleanup removed; DB-backed cleanup is handled elsewhere
+    // setInterval(() => { /* removed bjGames cleanup */ }, 10 * 60 * 1000);
 
     console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
     console.log('🧹 Game cleanup system initialized - runs every 10 minutes');
@@ -1255,34 +1202,7 @@ async function get24HourTopWinner() {
     });
 }
 
-// Function to recover from game state corruption
-function recoverGameState(userId) {
-    try {
-        const state = bjGames.get(userId);
-        if (!state) return null;
-
-        // Check for corrupted state
-        if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
-            console.log('Corrupted game state detected for user:', userId, '- cleaning up');
-            bjGames.delete(userId);
-            return null;
-        }
-
-        // Check if game is too old (more lenient timeouts)
-        const gameAge = Date.now() - state.startedAt;
-        if (gameAge > (state.split ? 25 * 60 * 1000 : 15 * 60 * 1000)) { // 25min for splits, 15min for regular
-            console.log('Game timeout detected for user:', userId, '- cleaning up');
-            bjGames.delete(userId);
-            return null;
-        }
-
-        return state;
-    } catch (error) {
-        console.error('Error recovering game state for user:', userId, error);
-        bjGames.delete(userId);
-        return null;
-    }
-}
+// Legacy in-memory recoverGameState removed; using async DB-backed version defined later
 
 // Function to update live leaderboard in #leaderboard channel
 async function updateLiveLeaderboard(client) {
@@ -1454,7 +1374,7 @@ client.on('interactionCreate', async (interaction) => {
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
 
             // Get game state with recovery mechanism
-            let state = recoverGameState(ownerId);
+            let state = await recoverGameState(ownerId);
             console.log('Button interaction for user:', ownerId, 'Action:', action, 'State found:', !!state);
 
             const isLegacyOnly = !state && isOldBJ;
@@ -1484,7 +1404,7 @@ client.on('interactionCreate', async (interaction) => {
             if (gameAge > 15 * 60 * 1000 && !state.split) { // Extended to 15 minutes
                 console.log(`⏰ Game timeout for user ${ownerId} - refunding bet`);
                 await refundBlackjackBet(state, 'timeout_regular');
-                bjGames.delete(ownerId);
+                await deleteBlackjackGame(ownerId);
                 try { await interaction.followUp({ content: '⏰ Game timed out after 15 minutes. Your bet has been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
                 return;
             }
@@ -1492,7 +1412,7 @@ client.on('interactionCreate', async (interaction) => {
             if (gameAge > 25 * 60 * 1000) {
                 console.log(`⏰ Split game timeout for user ${ownerId} - refunding bets`);
                 await refundBlackjackBet(state, 'timeout_split');
-                bjGames.delete(ownerId);
+                await deleteBlackjackGame(ownerId);
                 try { await interaction.followUp({ content: '⏰ Split game timed out after 25 minutes. Your bets have been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
                 return;
             }
@@ -1502,7 +1422,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
                     console.error('❌ Invalid player hand for user:', ownerId);
                     await refundBlackjackBet(state, 'corrupted_state');
-                    bjGames.delete(ownerId);
+                    await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
                     return;
                 }
@@ -1511,7 +1431,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (!state.dealer || !Array.isArray(state.dealer) || state.dealer.length < 2) {
                     console.error('❌ Invalid dealer hand for user:', ownerId);
                     await refundBlackjackBet(state, 'corrupted_dealer');
-                    bjGames.delete(ownerId);
+                    await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
                     return;
                 }
@@ -1520,7 +1440,7 @@ client.on('interactionCreate', async (interaction) => {
                 if (state.split && (!state.splitHand || !Array.isArray(state.splitHand) || state.splitHand.length === 0)) {
                     console.error('❌ Invalid split hand for user:', ownerId);
                     await refundBlackjackBet(state, 'corrupted_split');
-                    bjGames.delete(ownerId);
+                    await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Split game state corrupted. Your bets have been refunded! Please start a new game.', ephemeral: true }); } catch {}
                     return;
                 }
@@ -1575,7 +1495,7 @@ client.on('interactionCreate', async (interaction) => {
                     if (!state.player || state.player.length !== 2) {
                         console.error('❌ Invalid state for split - player should have exactly 2 cards');
                         await refundBlackjackBet(state, 'split_invalid_cards');
-                        bjGames.delete(ownerId);
+                        await deleteBlackjackGame(ownerId);
                         try { await interaction.followUp({ content: '❌ Invalid game state for split. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
                         return;
                     }
@@ -1617,7 +1537,7 @@ client.on('interactionCreate', async (interaction) => {
                         await refundBlackjackBet(state, 'split_error_original');
                         try { await interaction.followUp({ content: '❌ Error processing split. All bets have been refunded! Please start a new game.', ephemeral: true }); } catch {}
                         // Clean up corrupted game state
-                        bjGames.delete(ownerId);
+                        await deleteBlackjackGame(ownerId);
                     }
             } else if (action === 'surrender') {
                     await bjResolve(interaction, state, 'surrender');
@@ -1636,11 +1556,13 @@ client.on('interactionCreate', async (interaction) => {
         } catch (e) {
             console.error('❌ Blackjack button error for user', ownerId, ':', e);
             // Attempt to refund if there's a valid game state
-            const gameState = bjGames.get(ownerId);
-            if (gameState && !gameState.ended) {
-                await refundBlackjackBet(gameState, 'action_error');
-                bjGames.delete(ownerId);
-            }
+            try {
+                const gameState = await getBlackjackGame(ownerId);
+                if (gameState && !gameState.ended) {
+                    await refundBlackjackBet(gameState, 'action_error');
+                    await deleteBlackjackGame(ownerId);
+                }
+            } catch {}
             // Disable stale components so users don't keep clicking dead buttons
             await disableStaleInteractionComponents(interaction);
             try { await interaction.followUp({ content: '❌ Error processing action. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
