@@ -307,7 +307,7 @@ function changeUserBalance(userId, username, delta, reason, meta) {
                 if (next < 0) next = 0;
                 const upsertCb = (e2) => {
                     if (e2) { db.run('ROLLBACK'); reject(e2); return; }
-                    db.run('INSERT INTO ledger (user_id, delta, reason, meta) VALUES (?, ?, ?, ?)', [userId, delta, reason, meta ? JSON.stringify(meta) : null], (e3) => {
+                    db.run('INSERT INTO ledger (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)', [userId, delta, reason, meta ? JSON.stringify(meta) : null], (e3) => {
                         if (e3) { db.run('ROLLBACK'); reject(e3); return; }
                         db.run('COMMIT', (e4) => {
                             if (e4) { reject(e4); return; }
@@ -447,7 +447,7 @@ async function refundLastUnsettledBlackjackBet(userId) {
     try {
         const lastBet = await new Promise((resolve, reject) => {
             db.get(
-                `SELECT timestamp, delta, meta FROM ledger
+                `SELECT timestamp, delta, metadata FROM ledger
                  WHERE user_id = ? AND reason = 'blackjack_bet'
                  ORDER BY timestamp DESC
                  LIMIT 1`,
@@ -474,7 +474,7 @@ async function refundLastUnsettledBlackjackBet(userId) {
 
         let amount = Math.abs(Number(lastBet.delta || 0));
         try {
-            const meta = JSON.parse(lastBet.meta || '{}');
+            const meta = JSON.parse(lastBet.metadata || '{}');
             if (meta && typeof meta.bet === 'number') amount = meta.bet;
         } catch {}
 
@@ -2438,7 +2438,7 @@ client.on('interactionCreate', async (interaction) => {
         try {
             const transactions = await new Promise((resolve, reject) => {
                 db.all(
-                    `SELECT delta, reason, meta, timestamp FROM ledger
+                    `SELECT delta, reason, metadata, timestamp FROM ledger
                      WHERE user_id = ?
                      ORDER BY timestamp DESC
                      LIMIT ?`,
@@ -2468,7 +2468,7 @@ client.on('interactionCreate', async (interaction) => {
                 // Add additional details for transfers
                 if (tx.reason.includes('transfer')) {
                     try {
-                        const meta = JSON.parse(tx.meta || '{}');
+                        const meta = JSON.parse(tx.metadata || '{}');
                         if (meta.senderUsername || meta.recipientUsername) {
                             const otherUser = meta.senderUsername || meta.recipientUsername;
                             response += `  └─ ${otherUser}\n`;
