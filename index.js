@@ -291,7 +291,7 @@ function ensureCasinoChannel(interaction) {
 function getUserBalance(userId) {
     return new Promise((resolve, reject) => {
         db.get('SELECT points FROM vouch_points WHERE user_id = ?', [userId], (err, row) => {
-            if (err) reject(err); return; }
+            if (err) { reject(err); return; }
             resolve(row ? row.points : 0);
         });
     });
