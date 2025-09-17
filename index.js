@@ -15,7 +15,7 @@ const client = new Client({
 });
 
 // Initialize SQLite database with persistent storage path
-const dbPath = process.env.DATABASE_PATH || '/data/vouch_points.db';
+const dbPath = process.env.DB_PATH || './vouch_points.db';
 // Ensure directory exists (Railway persistent volume: /data)
 try {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -49,11 +49,18 @@ db.serialize(() => {
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        delta INTEGER NOT NULL,
-        reason TEXT NOT NULL,
-        meta TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        user_id TEXT,
+        username TEXT,
+        reason TEXT,
+        delta INTEGER,
+        balance INTEGER,
+        metadata TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS blackjack_games (
+        user_id TEXT PRIMARY KEY,
+        game_state TEXT NOT NULL,
+        last_updated INTEGER NOT NULL
     )`);
     db.run('CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)');
 });
@@ -256,9 +263,11 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
 // Casino helpers
 const bjGames = new Map(); // userId -> state
 const activeCooldowns = new Map(); // key -> timestamp
-const BLACKJACK_COOLDOWN_MS = 10 * 1000;
-const ROULETTE_COOLDOWN_MS = 10 * 1000;
+const BLACKJACK_COOLDOWN_MS = 3000;
+const ROULETTE_COOLDOWN_MS = 8000;
 const SLOTS_COOLDOWN_MS = 5 * 1000;
+const spinLocks = new Set(); // userId
+const slotsLocks = new Set(); // userId
 
 function nowMs() { return Date.now(); }
 
@@ -282,7 +291,7 @@ function ensureCasinoChannel(interaction) {
 function getUserBalance(userId) {
     return new Promise((resolve, reject) => {
         db.get('SELECT points FROM vouch_points WHERE user_id = ?', [userId], (err, row) => {
-            if (err) { reject(err); return; }
+            if (err) reject(err); return; }
             resolve(row ? row.points : 0);
         });
     });
@@ -1750,7 +1759,11 @@ client.on('interactionCreate', async (interaction) => {
             if (!ensureCasinoChannel(interaction)) { await interaction.reply({ content: 'Please use this in the #casino channel.', ephemeral: true }); return; }
             const cd = onCooldown('bj:' + interaction.user.id, BLACKJACK_COOLDOWN_MS);
             if (cd > 0) { await interaction.reply({ content: `Cooldown ${Math.ceil(cd/1000)}s.`, ephemeral: true }); return; }
-            if (bjGames.has(interaction.user.id)) { await interaction.reply({ content: 'You already have an active blackjack round.', ephemeral: true }); return; }
+            const existingGame = await getBlackjackGame(interaction.user.id).catch(() => null);
+            if (existingGame) {
+                await interaction.reply({ content: 'You already have an active blackjack round. Finish or surrender it first.', ephemeral: true });
+                return;
+            }
             const bet = Math.max(1, Math.floor(interaction.options.getInteger('amount') || 0));
             const balance = await getUserBalance(interaction.user.id);
             if (bet <= 0) { await interaction.reply({ content: 'Minimum bet is 1.', ephemeral: true }); return; }
@@ -1760,7 +1773,7 @@ client.on('interactionCreate', async (interaction) => {
             setCooldown('bj:' + interaction.user.id);
 
             const state = { userId: interaction.user.id, bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false, split: false, splitHand: null, currentSplitHand: 1 };
-            bjGames.set(interaction.user.id, state);
+            await saveBlackjackGame(interaction.user.id, state);
             await bjDealInitial(state);
 
             // Get 24-hour top winner for display
@@ -1800,12 +1813,12 @@ client.on('interactionCreate', async (interaction) => {
 
             // Auto-timeout to stand after 30s (reasonable for user experience)
             setTimeout(async () => {
-                const s = bjGames.get(interaction.user.id);
+                const s = await getBlackjackGame(interaction.user.id).catch(() => null);
                 if (!s || s.ended) return;
 
                 // Mark game as ended to prevent further actions
                 s.ended = true;
-                bjGames.delete(interaction.user.id);
+                await deleteBlackjackGame(interaction.user.id);
 
                 // Try to update the message to show timeout
                 try {
@@ -1869,7 +1882,7 @@ client.on('interactionCreate', async (interaction) => {
             // Moving wheel frames with pointer → slows down
             const ring = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];
             const pointer = '▼';
-            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
+            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server's VIP casino' }) ] });
             let idx = randomInt(0, ring.length-1);
             for (let speed of [60,60,80,100,120,140,160,200,240,300,360]) {
                 idx = (idx + 1) % ring.length;
@@ -1884,7 +1897,7 @@ client.on('interactionCreate', async (interaction) => {
 ║          🌟 SPINNING THE WHEEL • VIP 🌟           ║
 ╚══════════════════════════════════════════════════╝`;
                 await new Promise(r => setTimeout(r, speed));
-                await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(frame).setFooter({ text: '🎲 This server’s VIP casino' }) ] });
+                await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(frame).setFooter({ text: '🎲 This server's VIP casino' }) ] });
             }
             const result = randomInt(0, 36);
             const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
@@ -2561,5 +2574,146 @@ process.on('unhandledRejection', error => {
 
 // Login to Discord
 client.login(process.env.DISCORD_TOKEN);
+
+// ================================================================================= //
+// BLACKJACK GAME PERSISTENCE
+// ================================================================================= //
+
+const getBlackjackGame = (userId) => {
+    return new Promise((resolve, reject) => {
+        db.get('SELECT game_state FROM blackjack_games WHERE user_id = ?', [userId], (err, row) => {
+            if (err) return reject(err);
+            if (!row) return resolve(null);
+            try {
+                resolve(JSON.parse(row.game_state));
+            } catch (e) {
+                // Game state in DB is corrupted somehow, remove it
+                db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId]);
+                reject(e);
+            }
+        });
+    });
+};
+
+const saveBlackjackGame = (userId, state) => {
+    return new Promise((resolve, reject) => {
+        const gameStateJson = JSON.stringify(state);
+        const timestamp = Math.floor(Date.now() / 1000);
+        db.run(
+            'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
+            [userId, gameStateJson, timestamp],
+            (err) => {
+                if (err) return reject(err);
+                resolve();
+            }
+        );
+    });
+};
+
+const deleteBlackjackGame = (userId) => {
+    return new Promise((resolve, reject) => {
+        db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (err) => {
+            if (err) return reject(err);
+            resolve();
+        });
+    });
+};
+
+// Periodically clean up games that are stuck/expired (e.g., due to bot restart)
+setInterval(() => {
+    (async () => {
+        try {
+            const now = Date.now();
+            let cleaned = 0;
+            const games = await new Promise((resolve, reject) => {
+                db.all('SELECT user_id, game_state FROM blackjack_games', (err, rows) => {
+                    if (err) return reject(err);
+                    resolve(rows);
+                });
+            });
+
+            for (const row of games) {
+                const userId = row.user_id;
+                try {
+                    const state = JSON.parse(row.game_state);
+                    const gameAge = now - state.startedAt;
+                    // Timeout after 15 mins (regular) or 25 mins (split)
+                    if ((gameAge > 15 * 60 * 1000 && !state.split) || gameAge > 25 * 60 * 1000) {
+                        console.log(`🧹 Cleaning up expired blackjack game for user ${userId}`);
+                        const refundAmount = state.bet * (state.split ? 2 : 1) * (state.doubled ? 2 : 1);
+                        if (refundAmount > 0) {
+                            try {
+                                await changeUserBalance(userId, 'unknown', refundAmount, 'blackjack_refund_cleanup_timeout', {
+                                    bet: state.bet,
+                                    split: state.split,
+                                    doubled: state.doubled
+                                });
+                            } catch (refundError) {
+                                console.error(`Failed to refund user ${userId} during cleanup:`, refundError);
+                            }
+                        }
+                        await deleteBlackjackGame(userId);
+                        cleaned++;
+                    }
+                } catch (e) {
+                    // Game state is corrupted, refund original bet if possible and remove
+                    console.error(`🧹 Corrupted blackjack state for user ${userId}, refunding and cleaning up...`);
+                    const refundAmount = await getLatestBlackjackBet(userId);
+                    if (refundAmount > 0) {
+                        try {
+                            await changeUserBalance(userId, 'unknown', refundAmount, 'blackjack_refund_cleanup_corrupted', {
+                                bet: refundAmount
+                            });
+                        } catch (refundError) {
+                            console.error(`Failed to refund user ${userId} for corrupted state:`, refundError);
+                        }
+                    }
+                    await deleteBlackjackGame(userId);
+                    cleaned++;
+                }
+            }
+            if (cleaned > 0) {
+                console.log(`🧹 Cleaned up ${cleaned} expired/frozen blackjack games`);
+            }
+        } catch (e) {
+            console.error('Blackjack cleanup job error:', e);
+        }
+    })();
+}, 60 * 1000 * 5); // every 5 minutes
+
+// ================================================================================= //
+// LIVE LEADERBOARD
+// ================================================================================= //
+
+// ================================================================================= //
+// GAME UTILITIES
+// ================================================================================= //
+
+async function recoverGameState(userId) {
+    try {
+        const state = await getBlackjackGame(userId);
+        if (state) {
+            if (state.ended) {
+                await deleteBlackjackGame(userId);
+                return null;
+            }
+            // Check for timeout on recovery
+            const gameAge = Date.now() - state.startedAt;
+            if ((gameAge > 15 * 60 * 1000 && !state.split) || gameAge > 25 * 60 * 1000) {
+                await refundBlackjackBet(state, 'timeout_recovered');
+                await deleteBlackjackGame(userId);
+                return null;
+            }
+            return state;
+        }
+    } catch (e) {
+        console.error('Error recovering game state:', e);
+        await deleteBlackjackGame(userId).catch(() => {});
+    }
+    return null;
+}
+
+const getSlotsJackpot = () => getSetting('slots_jackpot', 10000);
+const setSlotsJackpot = (v) => setSetting('slots_jackpot', Math.floor(v));
 
 
