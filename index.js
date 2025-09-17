@@ -1882,7 +1882,7 @@ client.on('interactionCreate', async (interaction) => {
             // Moving wheel frames with pointer → slows down
             const ring = [0,32,15,19,4,21,2,25,17,34,6,27,13,36,11,30,8,23,10,5,24,16,33,1,20,14,31,9,22,18,29,7,28,12,35,3,26];
             const pointer = '▼';
-            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server's VIP casino' }) ] });
+            await interaction.reply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(wheelSpinning).setFooter({ text: '🎲 This server\'s VIP casino' }) ] });
             let idx = randomInt(0, ring.length-1);
             for (let speed of [60,60,80,100,120,140,160,200,240,300,360]) {
                 idx = (idx + 1) % ring.length;
@@ -1897,7 +1897,7 @@ client.on('interactionCreate', async (interaction) => {
 ║          🌟 SPINNING THE WHEEL • VIP 🌟           ║
 ╚══════════════════════════════════════════════════╝`;
                 await new Promise(r => setTimeout(r, speed));
-                await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(frame).setFooter({ text: '🎲 This server's VIP casino' }) ] });
+                await interaction.editReply({ embeds: [ new EmbedBuilder().setColor('#ff6b35').setDescription(frame).setFooter({ text: '🎲 This server\'s VIP casino' }) ] });
             }
             const result = randomInt(0, 36);
             const redSet = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
