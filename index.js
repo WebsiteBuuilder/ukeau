@@ -63,6 +63,12 @@ db.serialize(() => {
         last_updated INTEGER NOT NULL
     )`);
     db.run('CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON ledger(timestamp)');
+    
+    // Migration: Ensure ledger has all required columns for existing databases
+    db.run("ALTER TABLE ledger ADD COLUMN username TEXT", () => {}); // Ignore error if exists
+    db.run("ALTER TABLE ledger ADD COLUMN balance INTEGER", () => {}); // Ignore error if exists  
+    db.run("ALTER TABLE ledger ADD COLUMN metadata TEXT", () => {}); // Ignore error if exists
 });
 
 // Ensure username column exists on vouch_points (for persistent display names)
@@ -1182,7 +1188,7 @@ async function get24HourTopWinner() {
             FROM ledger l
             LEFT JOIN vouch_points v ON l.user_id = v.user_id
             WHERE (l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%')
-              AND l.created_at >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+              AND l.timestamp >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
             GROUP BY l.user_id
             ORDER BY net_wins DESC
             LIMIT 1
