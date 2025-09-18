@@ -919,6 +919,36 @@ client.once('ready', async () => {
     console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
     console.log('🧹 Game cleanup system initialized - runs every 10 minutes');
 
+    // Set up daily database backup (every 24 hours)
+    setInterval(async () => {
+        try {
+            console.log('💾 Creating daily database backup...');
+            const timestamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+            
+            // Get current vouch points data
+            const vouchData = await new Promise((resolve, reject) => {
+                db.all('SELECT user_id, points, username FROM vouch_points ORDER BY points DESC', (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows);
+                });
+            });
+
+            // Save backup data to settings table with timestamp
+            await setSetting(`backup_vouch_${timestamp}`, JSON.stringify({
+                timestamp: Date.now(),
+                totalUsers: vouchData.length,
+                totalPoints: vouchData.reduce((sum, u) => sum + u.points, 0),
+                data: vouchData
+            }));
+
+            console.log(`💾 Backup saved: ${vouchData.length} users, ${vouchData.reduce((sum, u) => sum + u.points, 0)} total points`);
+        } catch (error) {
+            console.error('❌ Backup error:', error);
+        }
+    }, 24 * 60 * 60 * 1000); // 24 hours
+
+    console.log('💾 Daily backup system initialized');
+
     // Register slash commands
     const commands = [
         {
@@ -969,6 +999,19 @@ client.once('ready', async () => {
             name: 'recountvouches',
             description: 'Admin: Recount all vouches in vouch channels and rebuild points',
             default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+        },
+        {
+            name: 'restorebackup',
+            description: 'Admin: Restore vouch points from a backup',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            options: [
+                {
+                    name: 'date',
+                    description: 'Backup date (YYYY-MM-DD format)',
+                    type: 3,
+                    required: true
+                }
+            ]
         },
         {
             name: 'sendpoints',
@@ -2225,6 +2268,78 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.editReply('❌ Error during recount. Check logs.');
         }
     }
+
+    if (interaction.commandName === 'restorebackup') {
+        if (!interaction.inGuild()) {
+            interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+            return;
+        }
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        if (!isAdmin) {
+            interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
+            return;
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            const date = interaction.options.getString('date');
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+                await interaction.editReply('❌ Invalid date format. Use YYYY-MM-DD (e.g., 2024-12-25)');
+                return;
+            }
+
+            // Get backup data
+            const backupKey = `backup_vouch_${date}`;
+            const backupData = await getSetting(backupKey, null);
+            if (!backupData) {
+                await interaction.editReply(`❌ No backup found for ${date}. Available backups are stored daily.`);
+                return;
+            }
+
+            const backup = JSON.parse(backupData);
+            if (!backup.data || !Array.isArray(backup.data)) {
+                await interaction.editReply('❌ Backup data is corrupted.');
+                return;
+            }
+
+            // Restore from backup
+            await new Promise((resolve, reject) => {
+                db.serialize(() => {
+                    db.run('BEGIN TRANSACTION');
+                    db.run('DELETE FROM vouch_points');
+                    const stmt = db.prepare('INSERT INTO vouch_points (user_id, points, username) VALUES (?, ?, ?)');
+                    for (const user of backup.data) {
+                        stmt.run(user.user_id, user.points, user.username);
+                    }
+                    stmt.finalize((err) => {
+                        if (err) {
+                            db.run('ROLLBACK');
+                            reject(err);
+                            return;
+                        }
+                        db.run('COMMIT', (err2) => {
+                            if (err2) reject(err2);
+                            else resolve();
+                        });
+                    });
+                });
+            });
+
+            await interaction.editReply(`✅ Backup restored from ${date}! Restored ${backup.data.length} users with ${backup.totalPoints} total points.`);
+            
+            // Update leaderboard after restore
+            try {
+                await updateLiveLeaderboard(interaction.client);
+            } catch (e) {
+                console.error('Leaderboard update after restore failed:', e);
+            }
+        } catch (e) {
+            console.error('Backup restore error:', e);
+            await interaction.editReply('❌ Error during backup restore. Check logs.');
+        }
+    }
+
     if (interaction.commandName === 'setmultiplier') {
         if (!interaction.inGuild()) {
             interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
