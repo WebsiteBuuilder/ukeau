@@ -486,6 +486,13 @@ async function refundLastUnsettledBlackjackBet(userId) {
         } catch {}
 
         if (!amount || amount <= 0) return false;
+        
+        // MONITORING: Track refund
+        if (global.gameMonitoring) {
+            global.gameMonitoring.totalGamesRefunded++;
+            console.log(`📊 Game refunded for user ${userId} (Total: ${global.gameMonitoring.totalGamesRefunded})`);
+        }
+        
         await changeUserBalance(userId, 'unknown', amount, 'blackjack_refund_no_active', { amount });
         return true;
     } catch (e) {
@@ -753,6 +760,13 @@ async function bjDealInitial(state) {
 async function bjResolve(interaction, state, action, fromTimeout = false) {
     if (state.ended) return;
     state.ended = true;
+    
+    // MONITORING: Track game completion
+    if (global.gameMonitoring) {
+        global.gameMonitoring.totalGamesCompleted++;
+        console.log(`📊 Game completed for user ${state.userId} (Total: ${global.gameMonitoring.totalGamesCompleted})`);
+    }
+    
     await deleteBlackjackGame(state.userId);
     
     // Handle split hands resolution
@@ -897,6 +911,22 @@ async function bjResolveSplit(interaction, state, action, fromTimeout = false) {
 
 // Removed legacy blackjack code above
 
+// GLOBAL ERROR HANDLING - From web search recommendations
+client.on('error', (error) => {
+    console.error('❌ Discord client error:', error);
+    // Don't crash the bot, just log the error
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't crash the bot for unhandled rejections
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    // Don't exit the process for uncaught exceptions in game logic
+});
+
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
@@ -949,6 +979,61 @@ client.once('ready', async () => {
     }, 24 * 60 * 60 * 1000); // 24 hours
 
     console.log('💾 Daily backup system initialized');
+
+    // MONITORING AND HEALTH CHECK SYSTEM - From web search recommendations
+    const monitoringStats = {
+        totalGamesStarted: 0,
+        totalGamesCompleted: 0,
+        totalGamesRefunded: 0,
+        corruptionAttempts: 0,
+        stateRepairs: 0,
+        databaseErrors: 0,
+        lastHealthCheck: Date.now()
+    };
+
+    // Health monitoring every 5 minutes
+    setInterval(async () => {
+        try {
+            console.log('🔍 Health Check - Game System Status:');
+            console.log(`📊 Games: ${monitoringStats.totalGamesStarted} started, ${monitoringStats.totalGamesCompleted} completed, ${monitoringStats.totalGamesRefunded} refunded`);
+            console.log(`🔧 Repairs: ${monitoringStats.stateRepairs} state repairs, ${monitoringStats.corruptionAttempts} corruption attempts`);
+            console.log(`💾 Database: ${monitoringStats.databaseErrors} errors`);
+            
+            // Calculate success rate
+            const totalActions = monitoringStats.totalGamesStarted;
+            const successRate = totalActions > 0 ? ((monitoringStats.totalGamesCompleted / totalActions) * 100).toFixed(1) : 100;
+            console.log(`✅ Success Rate: ${successRate}%`);
+            
+            // Check for concerning trends
+            if (monitoringStats.totalGamesRefunded > monitoringStats.totalGamesCompleted) {
+                console.warn('⚠️ WARNING: More games refunded than completed - investigating...');
+                // Auto-recovery: clear potentially stuck games
+                try {
+                    const stuckGames = await new Promise((resolve) => {
+                        db.all('SELECT user_id FROM blackjack_games WHERE last_updated < ?', [Date.now()/1000 - 1800], (err, rows) => {
+                            resolve(err ? [] : rows);
+                        });
+                    });
+                    if (stuckGames.length > 0) {
+                        console.log(`🧹 Auto-recovery: Clearing ${stuckGames.length} stuck games`);
+                        for (const game of stuckGames) {
+                            await deleteBlackjackGame(game.user_id);
+                        }
+                    }
+                } catch (e) {
+                    console.error('Auto-recovery failed:', e);
+                }
+            }
+            
+            monitoringStats.lastHealthCheck = Date.now();
+        } catch (error) {
+            console.error('❌ Health check error:', error);
+        }
+    }, 5 * 60 * 1000); // Every 5 minutes
+
+    // Make monitoring stats globally accessible
+    global.gameMonitoring = monitoringStats;
+    console.log('🔍 Game monitoring system initialized');
 
     // Register slash commands
     const commands = [
@@ -1780,6 +1865,13 @@ client.on('interactionCreate', async (interaction) => {
             setCooldown('bj:' + interaction.user.id);
 
             const state = { userId: interaction.user.id, bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false, split: false, splitHand: null, currentSplitHand: 1 };
+            
+            // MONITORING: Track game start
+            if (global.gameMonitoring) {
+                global.gameMonitoring.totalGamesStarted++;
+                console.log(`📊 Game started for user ${interaction.user.id} (Total: ${global.gameMonitoring.totalGamesStarted})`);
+            }
+            
             await saveBlackjackGame(interaction.user.id, state);
             await bjDealInitial(state);
             await saveBlackjackGame(interaction.user.id, state); // Save again after dealing initial cards
@@ -2656,88 +2748,334 @@ process.on('unhandledRejection', error => {
 client.login(process.env.DISCORD_TOKEN);
 
 // ================================================================================= //
-// BLACKJACK GAME PERSISTENCE
+// CENTRALIZED BLACKJACK GAME STATE MANAGER - From web search recommendations
 // ================================================================================= //
 
-const getBlackjackGame = (userId) => {
-    return new Promise((resolve, reject) => {
-        db.get('SELECT game_state FROM blackjack_games WHERE user_id = ?', [userId], (err, row) => {
-            if (err) {
-                console.error(`❌ Database error retrieving game for user ${userId}:`, err);
-                return reject(err);
+class BlackjackStateManager {
+    constructor(database) {
+        this.db = database;
+        this.locks = new Set();
+    }
+
+    // Atomic transaction wrapper for all database operations
+    async executeTransaction(operations) {
+        return new Promise((resolve, reject) => {
+            this.db.serialize(() => {
+                this.db.run('BEGIN TRANSACTION');
+                
+                const executeOperations = async () => {
+                    try {
+                        const results = [];
+                        for (const operation of operations) {
+                            const result = await operation();
+                            results.push(result);
+                        }
+                        
+                        this.db.run('COMMIT', (err) => {
+                            if (err) {
+                                console.error('❌ Transaction commit failed:', err);
+                                reject(err);
+                            } else {
+                                resolve(results);
+                            }
+                        });
+                    } catch (error) {
+                        console.error('❌ Transaction operation failed:', error);
+                        this.db.run('ROLLBACK');
+                        reject(error);
+                    }
+                };
+                
+                executeOperations();
+            });
+        });
+    }
+
+    // Enhanced state validation with detailed logging
+    validateGameState(state, userId, context = '') {
+        const errors = [];
+        
+        if (!state || typeof state !== 'object') {
+            errors.push('State is not a valid object');
+        } else {
+            if (!state.userId) errors.push('Missing userId');
+            if (!state.bet || typeof state.bet !== 'number') errors.push('Invalid bet amount');
+            if (!Array.isArray(state.player)) errors.push('Player hand is not an array');
+            if (!Array.isArray(state.dealer)) errors.push('Dealer hand is not an array');
+            if (state.startedAt && typeof state.startedAt !== 'number') errors.push('Invalid startedAt timestamp');
+            
+            // More lenient validation - allow empty hands during initialization
+            if (context !== 'initialization') {
+                if (state.player.length === 0) errors.push('Player hand is empty');
+                if (state.dealer.length === 0) errors.push('Dealer hand is empty');
             }
+        }
+
+        if (errors.length > 0) {
+            console.error(`❌ State validation failed for user ${userId} (${context}):`, errors);
+            return { valid: false, errors };
+        }
+
+        console.log(`✅ State validation passed for user ${userId} (${context})`);
+        return { valid: true, errors: [] };
+    }
+
+    // Robust game state retrieval with multiple fallback strategies
+    async getGame(userId) {
+        try {
+            const row = await new Promise((resolve, reject) => {
+                this.db.get('SELECT game_state, last_updated FROM blackjack_games WHERE user_id = ?', [userId], (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row);
+                });
+            });
+
             if (!row) {
                 console.log(`ℹ️ No game found for user ${userId}`);
-                return resolve(null);
+                return null;
             }
-            try {
-                const state = JSON.parse(row.game_state);
-                
-                // Validate the parsed state has required fields
-                if (!state || typeof state !== 'object') {
-                    throw new Error('Invalid state object');
-                }
-                if (!state.userId || !state.bet || !Array.isArray(state.player) || !Array.isArray(state.dealer)) {
-                    throw new Error('Missing required state fields');
-                }
-                
-                console.log(`✅ Game state retrieved for user ${userId}: ${state.player?.length || 0} player cards, ${state.dealer?.length || 0} dealer cards`);
-                resolve(state);
-            } catch (e) {
-                console.error(`❌ Game state corrupted for user ${userId}, removing:`, e);
-                // Game state in DB is corrupted somehow, remove it
-                db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (delErr) => {
-                    if (delErr) console.error('Failed to delete corrupted state:', delErr);
-                });
-                resolve(null); // Return null instead of rejecting to allow graceful fallback
-            }
-        });
-    });
-};
 
-const saveBlackjackGame = (userId, state, retries = 3) => {
-    return new Promise(async (resolve, reject) => {
+            let state;
+            try {
+                state = JSON.parse(row.game_state);
+            } catch (parseError) {
+                console.error(`❌ JSON parse error for user ${userId}:`, parseError);
+                await this.deleteGame(userId);
+                return null;
+            }
+
+            const validation = this.validateGameState(state, userId, 'retrieval');
+            if (!validation.valid) {
+                // MONITORING: Track corruption attempt
+                if (global.gameMonitoring) {
+                    global.gameMonitoring.corruptionAttempts++;
+                    console.log(`📊 Corruption detected for user ${userId} (Total: ${global.gameMonitoring.corruptionAttempts})`);
+                }
+                
+                // Instead of immediately deleting, try to repair the state
+                const repairedState = await this.repairGameState(state, userId);
+                if (repairedState) {
+                    // MONITORING: Track successful repair
+                    if (global.gameMonitoring) {
+                        global.gameMonitoring.stateRepairs++;
+                        console.log(`📊 State repaired for user ${userId} (Total: ${global.gameMonitoring.stateRepairs})`);
+                    }
+                    
+                    console.log(`🔧 Successfully repaired game state for user ${userId}`);
+                    await this.saveGame(userId, repairedState);
+                    return repairedState;
+                } else {
+                    console.log(`❌ Could not repair state for user ${userId}, removing game`);
+                    
+                    // MONITORING: Track refund from corruption
+                    if (global.gameMonitoring) {
+                        global.gameMonitoring.totalGamesRefunded++;
+                        console.log(`📊 Game refunded due to corruption for user ${userId} (Total: ${global.gameMonitoring.totalGamesRefunded})`);
+                    }
+                    
+                    await this.deleteGame(userId);
+                    return null;
+                }
+            }
+
+            // Check for stale games (over 30 minutes old)
+            const gameAge = Date.now() - (state.startedAt || 0);
+            if (gameAge > 30 * 60 * 1000) {
+                console.log(`⏰ Game too old for user ${userId} (${Math.round(gameAge/60000)}min), cleaning up`);
+                await this.deleteGame(userId);
+                return null;
+            }
+
+            console.log(`✅ Retrieved valid game for user ${userId}: ${state.player?.length || 0} player, ${state.dealer?.length || 0} dealer`);
+            return state;
+        } catch (error) {
+            console.error(`❌ Error retrieving game for user ${userId}:`, error);
+            return null;
+        }
+    }
+
+    // Attempt to repair corrupted game state
+    async repairGameState(state, userId) {
         try {
+            const repairs = {};
+            
+            // Repair missing basic fields
+            if (!state.userId) repairs.userId = userId;
+            if (!state.bet || typeof state.bet !== 'number') repairs.bet = 1;
+            if (!Array.isArray(state.player)) repairs.player = [];
+            if (!Array.isArray(state.dealer)) repairs.dealer = [];
+            if (!state.startedAt || typeof state.startedAt !== 'number') repairs.startedAt = Date.now();
+            if (typeof state.ended !== 'boolean') repairs.ended = false;
+            
+            // If too many repairs needed, don't try to fix
+            if (Object.keys(repairs).length > 3) {
+                console.log(`❌ Too many repairs needed for user ${userId}, cannot fix`);
+                return null;
+            }
+
+            if (Object.keys(repairs).length === 0) {
+                return null; // No repairs possible
+            }
+
+            const repairedState = { ...state, ...repairs };
+            console.log(`🔧 Repaired state for user ${userId}:`, Object.keys(repairs));
+            
+            return repairedState;
+        } catch (error) {
+            console.error(`❌ Error repairing state for user ${userId}:`, error);
+            return null;
+        }
+    }
+}
+
+// Global state manager instance
+const gameStateManager = new BlackjackStateManager(db);
+
+// Legacy wrapper functions for compatibility
+const getBlackjackGame = (userId) => gameStateManager.getGame(userId);
+
+// Add methods to the state manager class
+BlackjackStateManager.prototype.saveGame = async function(userId, state) {
+    // Validate state before saving
+    const validation = this.validateGameState(state, userId, 'saving');
+    if (!validation.valid) {
+        throw new Error(`Cannot save invalid state: ${validation.errors.join(', ')}`);
+    }
+
+    const operations = [
+        () => new Promise((resolve, reject) => {
             const gameStateJson = JSON.stringify(state);
             const timestamp = Math.floor(Date.now() / 1000);
             
-            const attemptSave = (attempt) => {
+            this.db.run(
+                'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
+                [userId, gameStateJson, timestamp],
+                (err) => {
+                    if (err) {
+                        console.error(`❌ Failed to save game for user ${userId}:`, err);
+                        reject(err);
+                    } else {
+                        console.log(`✅ Game saved for user ${userId}`);
+                        resolve();
+                    }
+                }
+            );
+        })
+    ];
+
+    try {
+        await this.executeTransaction(operations);
+        return true;
+    } catch (error) {
+        console.error(`❌ Transaction failed saving game for user ${userId}:`, error);
+        // Try a direct save as fallback
+        return new Promise((resolve, reject) => {
+            const gameStateJson = JSON.stringify(state);
+            const timestamp = Math.floor(Date.now() / 1000);
+            
+            this.db.run(
+                'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
+                [userId, gameStateJson, timestamp],
+                (err) => {
+                    if (err) {
+                        console.error(`❌ Fallback save failed for user ${userId}:`, err);
+                        reject(err);
+                    } else {
+                        console.log(`✅ Fallback save succeeded for user ${userId}`);
+                        resolve(true);
+                    }
+                }
+            );
+        });
+    }
+};
+
+BlackjackStateManager.prototype.deleteGame = async function(userId) {
+    const operations = [
+        () => new Promise((resolve, reject) => {
+            this.db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (err) => {
+                if (err) {
+                    console.error(`❌ Failed to delete game for user ${userId}:`, err);
+                    reject(err);
+                } else {
+                    console.log(`✅ Game deleted for user ${userId}`);
+                    resolve();
+                }
+            });
+        })
+    ];
+
+    try {
+        await this.executeTransaction(operations);
+        return true;
+    } catch (error) {
+        console.error(`❌ Transaction failed deleting game for user ${userId}:`, error);
+        // Try direct delete as fallback
+        return new Promise((resolve) => {
+            this.db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (err) => {
+                if (err) {
+                    console.error(`❌ Fallback delete failed for user ${userId}:`, err);
+                    resolve(false);
+                } else {
+                    console.log(`✅ Fallback delete succeeded for user ${userId}`);
+                    resolve(true);
+                }
+            });
+        });
+    }
+};
+
+// Robust save function with fallbacks and retry logic  
+const saveBlackjackGame = async (userId, state) => {
+    try {
+        return await gameStateManager.saveGame(userId, state);
+    } catch (error) {
+        console.error(`❌ State manager save failed for user ${userId}, trying legacy method:`, error);
+        // Fallback to legacy method if state manager fails
+        return new Promise((resolve, reject) => {
+            try {
+                const gameStateJson = JSON.stringify(state);
+                const timestamp = Math.floor(Date.now() / 1000);
+                
                 db.run(
                     'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
                     [userId, gameStateJson, timestamp],
                     (err) => {
                         if (err) {
-                            console.error(`❌ Save blackjack game attempt ${attempt} failed for user ${userId}:`, err);
-                            if (attempt < retries) {
-                                console.log(`🔄 Retrying save for user ${userId}, attempt ${attempt + 1}/${retries}`);
-                                setTimeout(() => attemptSave(attempt + 1), 100 * attempt); // exponential backoff
-                            } else {
-                                console.error(`❌ All save attempts failed for user ${userId}`);
-                                reject(err);
-                            }
+                            console.error(`❌ Legacy save also failed for user ${userId}:`, err);
+                            reject(err);
                         } else {
-                            console.log(`✅ Blackjack game saved successfully for user ${userId} (attempt ${attempt})`);
-                            resolve();
+                            console.log(`✅ Legacy save succeeded for user ${userId}`);
+                            resolve(true);
                         }
                     }
                 );
-            };
-            
-            attemptSave(1);
-        } catch (e) {
-            console.error(`❌ JSON serialization failed for user ${userId}:`, e);
-            reject(e);
-        }
-    });
+            } catch (e) {
+                console.error(`❌ JSON serialization failed for user ${userId}:`, e);
+                reject(e);
+            }
+        });
+    }
 };
 
-const deleteBlackjackGame = (userId) => {
-    return new Promise((resolve, reject) => {
-        db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (err) => {
-            if (err) return reject(err);
-            resolve();
+const deleteBlackjackGame = async (userId) => {
+    try {
+        return await gameStateManager.deleteGame(userId);
+    } catch (error) {
+        console.error(`❌ State manager delete failed for user ${userId}, trying legacy method:`, error);
+        // Fallback to legacy method
+        return new Promise((resolve) => {
+            db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (err) => {
+                if (err) {
+                    console.error(`❌ Legacy delete also failed for user ${userId}:`, err);
+                    resolve(false);
+                } else {
+                    console.log(`✅ Legacy delete succeeded for user ${userId}`);
+                    resolve(true);
+                }
+            });
         });
-    });
+    }
 };
 
 // Periodically clean up games that are stuck/expired (e.g., due to bot restart)
