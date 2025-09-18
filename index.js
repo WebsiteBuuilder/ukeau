@@ -268,6 +268,7 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
 
 // Casino helpers (DB-backed; no in-memory bjGames)
 const activeCooldowns = new Map(); // key -> timestamp
+const blackjackLocks = new Set(); // userId - prevent race conditions
 const BLACKJACK_COOLDOWN_MS = 3000;
 const ROULETTE_COOLDOWN_MS = 8000;
 const SLOTS_COOLDOWN_MS = 5 * 1000;
@@ -1422,13 +1423,23 @@ client.on('interactionCreate', async (interaction) => {
             }
             if (interaction.user.id !== ownerId) { try { await interaction.followUp({ content: 'This is not your game.', ephemeral: true }); } catch {} return; }
 
-            // Get game state with recovery mechanism
-            let state = await recoverGameState(ownerId);
+            // Prevent race conditions from rapid button clicks
+            if (blackjackLocks.has(ownerId)) {
+                console.log(`🔒 Action already in progress for user ${ownerId}, ignoring duplicate click`);
+                try { await interaction.followUp({ content: '⏳ Please wait, your previous action is still processing...', ephemeral: true }); } catch {}
+                return;
+            }
+            blackjackLocks.add(ownerId);
+
+            try {
+                // Get game state with recovery mechanism
+                let state = await recoverGameState(ownerId);
             console.log('Button interaction for user:', ownerId, 'Action:', action, 'State found:', !!state);
 
             const isLegacyOnly = !state && isOldBJ;
             if (!state && isLegacyOnly) {
                 try { await interaction.followUp({ content: 'Game was reset to new version. Start a fresh /blackjack.', ephemeral: true }); } catch {}
+                blackjackLocks.delete(ownerId);
                 return;
             }
             if (!state) {
@@ -1441,10 +1452,12 @@ client.on('interactionCreate', async (interaction) => {
                     ? 'No active game found. Your last blackjack bet has been refunded. Use `/blackjack` to start a new game.'
                     : 'No active game found. Use `/blackjack` to start a new game.';
                 try { await interaction.followUp({ content: msg, ephemeral: true }); } catch {}
+                blackjackLocks.delete(ownerId);
                 return;
             }
             if (state.ended) { 
                 try { await interaction.followUp({ content: 'Game already finished. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
+                blackjackLocks.delete(ownerId);
                 return; 
             }
             
@@ -1455,6 +1468,7 @@ client.on('interactionCreate', async (interaction) => {
                 await refundBlackjackBet(state, 'timeout_regular');
                 await deleteBlackjackGame(ownerId);
                 try { await interaction.followUp({ content: '⏰ Game timed out after 15 minutes. Your bet has been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                blackjackLocks.delete(ownerId);
                 return;
             }
             // Allow extra time for split games (25 minutes total) - with refund
@@ -1463,6 +1477,7 @@ client.on('interactionCreate', async (interaction) => {
                 await refundBlackjackBet(state, 'timeout_split');
                 await deleteBlackjackGame(ownerId);
                 try { await interaction.followUp({ content: '⏰ Split game timed out after 25 minutes. Your bets have been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                blackjackLocks.delete(ownerId);
                 return;
             }
 
@@ -1473,6 +1488,7 @@ client.on('interactionCreate', async (interaction) => {
                     await refundBlackjackBet(state, 'corrupted_state');
                     await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
+                    blackjackLocks.delete(ownerId);
                     return;
                 }
 
@@ -1482,6 +1498,7 @@ client.on('interactionCreate', async (interaction) => {
                     await refundBlackjackBet(state, 'corrupted_dealer');
                     await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
+                    blackjackLocks.delete(ownerId);
                     return;
                 }
 
@@ -1491,6 +1508,7 @@ client.on('interactionCreate', async (interaction) => {
                     await refundBlackjackBet(state, 'corrupted_split');
                     await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Split game state corrupted. Your bets have been refunded! Please start a new game.', ephemeral: true }); } catch {}
+                    blackjackLocks.delete(ownerId);
                     return;
                 }
 
@@ -1499,7 +1517,12 @@ client.on('interactionCreate', async (interaction) => {
                         // Handle split hand hitting - alternate between hands
                         const currentHand = state.currentSplitHand === 1 ? state.player : state.splitHand;
                         currentHand.push(bjDraw(state));
-                        await saveBlackjackGame(ownerId, state); // Save after modifying state
+                        try {
+                            await saveBlackjackGame(ownerId, state); // Save after modifying state
+                        } catch (saveError) {
+                            console.error(`❌ Failed to save game state after hit for user ${ownerId}:`, saveError);
+                            // Continue anyway, but log the error
+                        }
                         const pv = handValue(currentHand);
                         if (pv >= 21) {
                             // Move to next hand or resolve
@@ -1609,6 +1632,10 @@ client.on('interactionCreate', async (interaction) => {
                     }
                     return;
             }
+            } finally {
+                // Always release the lock
+                blackjackLocks.delete(ownerId);
+            }
         } catch (e) {
             console.error('❌ Blackjack button error for user', ownerId, ':', e);
             // Attempt to refund if there's a valid game state
@@ -1622,6 +1649,8 @@ client.on('interactionCreate', async (interaction) => {
             // Disable stale components so users don't keep clicking dead buttons
             await disableStaleInteractionComponents(interaction);
             try { await interaction.followUp({ content: '❌ Error processing action. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
+            // Release lock on error too
+            blackjackLocks.delete(ownerId);
         }
         } catch (error) {
             console.error('Button interaction error:', error);
@@ -2633,31 +2662,72 @@ client.login(process.env.DISCORD_TOKEN);
 const getBlackjackGame = (userId) => {
     return new Promise((resolve, reject) => {
         db.get('SELECT game_state FROM blackjack_games WHERE user_id = ?', [userId], (err, row) => {
-            if (err) return reject(err);
-            if (!row) return resolve(null);
+            if (err) {
+                console.error(`❌ Database error retrieving game for user ${userId}:`, err);
+                return reject(err);
+            }
+            if (!row) {
+                console.log(`ℹ️ No game found for user ${userId}`);
+                return resolve(null);
+            }
             try {
-                resolve(JSON.parse(row.game_state));
+                const state = JSON.parse(row.game_state);
+                
+                // Validate the parsed state has required fields
+                if (!state || typeof state !== 'object') {
+                    throw new Error('Invalid state object');
+                }
+                if (!state.userId || !state.bet || !Array.isArray(state.player) || !Array.isArray(state.dealer)) {
+                    throw new Error('Missing required state fields');
+                }
+                
+                console.log(`✅ Game state retrieved for user ${userId}: ${state.player?.length || 0} player cards, ${state.dealer?.length || 0} dealer cards`);
+                resolve(state);
             } catch (e) {
+                console.error(`❌ Game state corrupted for user ${userId}, removing:`, e);
                 // Game state in DB is corrupted somehow, remove it
-                db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId]);
-                reject(e);
+                db.run('DELETE FROM blackjack_games WHERE user_id = ?', [userId], (delErr) => {
+                    if (delErr) console.error('Failed to delete corrupted state:', delErr);
+                });
+                resolve(null); // Return null instead of rejecting to allow graceful fallback
             }
         });
     });
 };
 
-const saveBlackjackGame = (userId, state) => {
-    return new Promise((resolve, reject) => {
-        const gameStateJson = JSON.stringify(state);
-        const timestamp = Math.floor(Date.now() / 1000);
-        db.run(
-            'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
-            [userId, gameStateJson, timestamp],
-            (err) => {
-                if (err) return reject(err);
-                resolve();
-            }
-        );
+const saveBlackjackGame = (userId, state, retries = 3) => {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const gameStateJson = JSON.stringify(state);
+            const timestamp = Math.floor(Date.now() / 1000);
+            
+            const attemptSave = (attempt) => {
+                db.run(
+                    'INSERT OR REPLACE INTO blackjack_games (user_id, game_state, last_updated) VALUES (?, ?, ?)',
+                    [userId, gameStateJson, timestamp],
+                    (err) => {
+                        if (err) {
+                            console.error(`❌ Save blackjack game attempt ${attempt} failed for user ${userId}:`, err);
+                            if (attempt < retries) {
+                                console.log(`🔄 Retrying save for user ${userId}, attempt ${attempt + 1}/${retries}`);
+                                setTimeout(() => attemptSave(attempt + 1), 100 * attempt); // exponential backoff
+                            } else {
+                                console.error(`❌ All save attempts failed for user ${userId}`);
+                                reject(err);
+                            }
+                        } else {
+                            console.log(`✅ Blackjack game saved successfully for user ${userId} (attempt ${attempt})`);
+                            resolve();
+                        }
+                    }
+                );
+            };
+            
+            attemptSave(1);
+        } catch (e) {
+            console.error(`❌ JSON serialization failed for user ${userId}:`, e);
+            reject(e);
+        }
     });
 };
 
