@@ -1467,18 +1467,18 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             try {
-                // Enhanced game state validation with automatic refunds
-                if (!state.player || !Array.isArray(state.player) || state.player.length === 0) {
-                    console.error('❌ Invalid player hand for user:', ownerId);
+                // Enhanced game state validation with automatic refunds (more lenient)
+                if (!state.player || !Array.isArray(state.player)) {
+                    console.error('❌ Invalid player hand structure for user:', ownerId);
                     await refundBlackjackBet(state, 'corrupted_state');
                     await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
                     return;
                 }
 
-                // Validate dealer hand
-                if (!state.dealer || !Array.isArray(state.dealer) || state.dealer.length < 2) {
-                    console.error('❌ Invalid dealer hand for user:', ownerId);
+                // Validate dealer hand (allow incomplete hands during game setup)
+                if (!state.dealer || !Array.isArray(state.dealer) || (state.dealer.length < 1 && action !== 'surrender')) {
+                    console.error('❌ Invalid dealer hand structure for user:', ownerId);
                     await refundBlackjackBet(state, 'corrupted_dealer');
                     await deleteBlackjackGame(ownerId);
                     try { await interaction.followUp({ content: '❌ Game state corrupted. Your bet has been refunded! Please start a new game.', ephemeral: true }); } catch {}
@@ -1499,11 +1499,13 @@ client.on('interactionCreate', async (interaction) => {
                         // Handle split hand hitting - alternate between hands
                         const currentHand = state.currentSplitHand === 1 ? state.player : state.splitHand;
                         currentHand.push(bjDraw(state));
+                        await saveBlackjackGame(ownerId, state); // Save after modifying state
                         const pv = handValue(currentHand);
                         if (pv >= 21) {
                             // Move to next hand or resolve
                             if (state.currentSplitHand === 1) {
                                 state.currentSplitHand = 2;
+                                await saveBlackjackGame(ownerId, state); // Save after changing current hand
                                 await bjUpdateView(state, { hideDealerHole: true, note: '\n🎯 Hand 1 complete! Now playing Hand 2.' }, interaction);
                             } else {
                                 await bjResolve(interaction, state, 'stand');
@@ -1513,6 +1515,7 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     } else {
                         state.player.push(bjDraw(state));
+                        await saveBlackjackGame(ownerId, state); // Save after modifying state
                     const pv = handValue(state.player);
                     if (pv >= 21) {
                             await bjResolve(interaction, state, 'stand');
@@ -1524,6 +1527,7 @@ client.on('interactionCreate', async (interaction) => {
                     if (state.split && state.currentSplitHand === 1) {
                         // Move to second hand
                         state.currentSplitHand = 2;
+                        await saveBlackjackGame(ownerId, state); // Save after changing current hand
                         await bjUpdateView(state, { hideDealerHole: true, note: '\n✋ Hand 1 stood. Now playing Hand 2.' }, interaction);
                     } else {
                         await bjResolve(interaction, state, 'stand');
@@ -1536,6 +1540,7 @@ client.on('interactionCreate', async (interaction) => {
                     state.bet *= 2;
                     state.doubled = true;
                     state.player.push(bjDraw(state));
+                    await saveBlackjackGame(ownerId, state); // Save after modifying state
                     await bjResolve(interaction, state, 'stand');
                 } else if (action === 'split') {
                     console.log('🎯 Split action triggered for user:', ownerId);
@@ -1575,6 +1580,8 @@ client.on('interactionCreate', async (interaction) => {
                         // Deal one card to each hand
                         state.player.push(bjDraw(state));
                         state.splitHand.push(bjDraw(state));
+                        
+                        await saveBlackjackGame(ownerId, state); // Save after splitting and dealing cards
 
                         console.log('✅ Split successful for user:', ownerId, 'Hands:', state.player, state.splitHand);
 
@@ -1746,6 +1753,7 @@ client.on('interactionCreate', async (interaction) => {
             const state = { userId: interaction.user.id, bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false, split: false, splitHand: null, currentSplitHand: 1 };
             await saveBlackjackGame(interaction.user.id, state);
             await bjDealInitial(state);
+            await saveBlackjackGame(interaction.user.id, state); // Save again after dealing initial cards
 
             // Get 24-hour top winner for display
             const topWinner = await get24HourTopWinner();
