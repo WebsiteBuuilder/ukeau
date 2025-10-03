@@ -449,6 +449,45 @@ async function disableStaleInteractionComponents(interaction) {
     } catch {}
 }
 
+function ensureBlackjackBetDefaults(state) {
+    if (!state || typeof state !== 'object') return state;
+    const numeric = (value) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : 0;
+    };
+
+    if (!numeric(state.baseBet)) {
+        const fallback = numeric(state.bet) || numeric(state.initialBet) || numeric(state.originalBet);
+        if (fallback > 0) state.baseBet = fallback;
+    }
+
+    if (!numeric(state.bet) && numeric(state.baseBet) > 0) {
+        state.bet = numeric(state.baseBet);
+    }
+
+    return state;
+}
+
+function getBlackjackPerHandBet(state) {
+    if (!state) return 0;
+    const candidates = [state.bet, state.baseBet, state.initialBet, state.originalBet];
+    for (const value of candidates) {
+        const n = Number(value);
+        if (Number.isFinite(n) && n > 0) {
+            return n;
+        }
+    }
+    return 0;
+}
+
+function calculateBlackjackTotalStake(state) {
+    if (!state) return 0;
+    const perHand = getBlackjackPerHandBet(state);
+    if (!perHand) return 0;
+    const hands = state.split ? 2 : 1;
+    return perHand * hands;
+}
+
 // Refund most recent unsettled blackjack bet if present (used when state missing)
 async function refundLastUnsettledBlackjackBet(userId) {
     try {
@@ -471,7 +510,8 @@ async function refundLastUnsettledBlackjackBet(userId) {
                     reason LIKE 'blackjack_payout%' OR
                     reason LIKE 'blackjack_split_payout%' OR
                     reason LIKE 'blackjack_refund_%' OR
-                    reason = 'blackjack_settled'
+                    reason = 'blackjack_settled' OR
+                    reason LIKE 'blackjack_timeout_forfeit%'
                  )`,
                 [userId, lastBet.timestamp],
                 (err, row) => err ? reject(err) : resolve(row?.c || 0)
@@ -482,18 +522,46 @@ async function refundLastUnsettledBlackjackBet(userId) {
         let amount = Math.abs(Number(lastBet.delta || 0));
         try {
             const meta = JSON.parse(lastBet.metadata || '{}');
-            if (meta && typeof meta.bet === 'number') amount = meta.bet;
+            if (meta && Number.isFinite(Number(meta.bet))) {
+                amount = Math.abs(Number(meta.bet));
+            }
         } catch {}
 
+        const extras = await new Promise((resolve, reject) => {
+            db.all(
+                `SELECT reason, delta, metadata FROM ledger
+                 WHERE user_id = ? AND timestamp >= ? AND reason IN ('blackjack_double_bet','blackjack_split_bet')`,
+                [userId, lastBet.timestamp],
+                (err, rows) => err ? reject(err) : resolve(rows || [])
+            );
+        });
+
+        const extraDetails = [];
+        for (const row of extras) {
+            let extra = Math.abs(Number(row?.delta || 0));
+            try {
+                const meta = JSON.parse(row?.metadata || '{}');
+                if (meta && Number.isFinite(Number(meta.bet))) {
+                    extra = Math.abs(Number(meta.bet));
+                }
+            } catch {}
+            if (extra > 0) {
+                amount += extra;
+                extraDetails.push({ reason: row.reason, amount: extra });
+            }
+        }
+
         if (!amount || amount <= 0) return false;
-        
+
         // MONITORING: Track refund
         if (global.gameMonitoring) {
             global.gameMonitoring.totalGamesRefunded++;
             console.log(`📊 Game refunded for user ${userId} (Total: ${global.gameMonitoring.totalGamesRefunded})`);
         }
-        
-        await changeUserBalance(userId, 'unknown', amount, 'blackjack_refund_no_active', { amount });
+
+        const metadata = { amount };
+        if (extraDetails.length > 0) metadata.extras = extraDetails;
+        await changeUserBalance(userId, 'unknown', amount, 'blackjack_refund_no_active', metadata);
         return true;
     } catch (e) {
         console.error('refundLastUnsettledBlackjackBet error:', e);
@@ -833,12 +901,15 @@ async function bjResolve(interaction, state, action, fromTimeout = false) {
 // Automatic refund function for failed games
 async function refundBlackjackBet(state, reason) {
     try {
-        const refundAmount = state.bet || 0;
+        ensureBlackjackBetDefaults(state);
+        const refundAmount = calculateBlackjackTotalStake(state);
         if (refundAmount > 0) {
             console.log(`🔄 Refunding ${refundAmount} points to user ${state.userId} (${reason})`);
             await changeUserBalance(state.userId, 'unknown', refundAmount, `blackjack_refund_${reason}`, {
                 originalBet: refundAmount,
-                reason: reason
+                reason,
+                split: !!state.split,
+                doubled: !!state.doubled
             });
             return true;
         }
@@ -846,6 +917,71 @@ async function refundBlackjackBet(state, reason) {
         console.error('Failed to refund blackjack bet:', error);
     }
     return false;
+}
+
+async function settleBlackjackTimeout(state, { interaction = null, source = 'timeout', notifyUser = true } = {}) {
+    if (!state) return 0;
+    ensureBlackjackBetDefaults(state);
+    const totalStake = calculateBlackjackTotalStake(state);
+    state.ended = true;
+
+    const reasonKey = `blackjack_timeout_forfeit_${source}`;
+    const meta = {
+        source,
+        totalStake,
+        split: !!state.split,
+        doubled: !!state.doubled
+    };
+
+    try {
+        await deleteBlackjackGame(state.userId);
+    } catch (e) {
+        console.error('Failed to delete timed-out blackjack game:', e);
+    }
+
+    try {
+        await changeUserBalance(state.userId, interaction?.user?.username || 'unknown', 0, reasonKey, meta);
+    } catch (e) {
+        console.error('Failed to record blackjack timeout forfeit:', e);
+    }
+
+    if (interaction) {
+        const elapsedMs = Math.max(0, Date.now() - (state.startedAt || Date.now()));
+        const minutes = Math.max(1, Math.round(elapsedMs / 60000));
+        const perHand = getBlackjackPerHandBet(state);
+        const lines = [];
+        if (state.split) {
+            lines.push(`⏰ Split game expired after ${minutes} minute${minutes === 1 ? '' : 's'} of inactivity.`);
+            lines.push(`💸 Both bets (${perHand} each) were forfeited.`);
+        } else {
+            lines.push(`⏰ Game expired after ${minutes} minute${minutes === 1 ? '' : 's'} of inactivity.`);
+            if (totalStake > 0) {
+                lines.push(`💸 Bet of ${totalStake} was forfeited.`);
+            }
+        }
+        lines.push('Please start a new `/blackjack` game when you are ready.');
+
+        try {
+            const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}`, result: '💔 TIMEOUT FORFEIT 💔' });
+            await updateGame(interaction, state, { embeds: [embed], components: [] });
+        } catch (e) {
+            console.error('Failed to update timed-out blackjack message:', e);
+        }
+
+        if (notifyUser) {
+            const summary = state.split
+                ? `Both of your ${perHand} bets were forfeited after the game expired.`
+                : `Your bet of ${totalStake} was forfeited after the game expired.`;
+            try {
+                await interaction.followUp({
+                    content: `⏰ Blackjack game expired. ${summary}`,
+                    ephemeral: true
+                });
+            } catch {}
+        }
+    }
+
+    return totalStake;
 }
 
 async function bjResolveSplit(interaction, state, action, fromTimeout = false) {
@@ -1540,28 +1676,35 @@ client.on('interactionCreate', async (interaction) => {
                 blackjackLocks.delete(ownerId);
                 return;
             }
-            if (state.ended) { 
-                try { await interaction.followUp({ content: 'Game already finished. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {} 
-                blackjackLocks.delete(ownerId);
-                return; 
-            }
-            
-            // Check if game is too old - with automatic refunds
-            const gameAge = Date.now() - state.startedAt;
-            if (gameAge > 15 * 60 * 1000 && !state.split) { // Extended to 15 minutes
-                console.log(`⏰ Game timeout for user ${ownerId} - refunding bet`);
-                await refundBlackjackBet(state, 'timeout_regular');
-                await deleteBlackjackGame(ownerId);
-                try { await interaction.followUp({ content: '⏰ Game timed out after 15 minutes. Your bet has been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+            if (state.ended) {
+                try { await interaction.followUp({ content: 'Game already finished. Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
                 blackjackLocks.delete(ownerId);
                 return;
             }
-            // Allow extra time for split games (25 minutes total) - with refund
+
+            if (state.timedOut) {
+                console.log(`⏰ Game already timed out for user ${ownerId}. Settling as forfeit.`);
+                await settleBlackjackTimeout(state, {
+                    interaction,
+                    source: state.timeoutReason || (state.split ? 'split' : 'regular'),
+                    notifyUser: true
+                });
+                blackjackLocks.delete(ownerId);
+                return;
+            }
+
+            // Check if game is too old - with automatic forfeits
+            const gameAge = Date.now() - state.startedAt;
+            if (gameAge > 15 * 60 * 1000 && !state.split) { // Extended to 15 minutes
+                console.log(`⏰ Game timeout for user ${ownerId} - forfeiting bet`);
+                await settleBlackjackTimeout(state, { interaction, source: 'regular', notifyUser: true });
+                blackjackLocks.delete(ownerId);
+                return;
+            }
+            // Allow extra time for split games (25 minutes total) - with forfeit
             if (gameAge > 25 * 60 * 1000) {
-                console.log(`⏰ Split game timeout for user ${ownerId} - refunding bets`);
-                await refundBlackjackBet(state, 'timeout_split');
-                await deleteBlackjackGame(ownerId);
-                try { await interaction.followUp({ content: '⏰ Split game timed out after 25 minutes. Your bets have been refunded! Use `/blackjack` to start a new game.', ephemeral: true }); } catch {}
+                console.log(`⏰ Split game timeout for user ${ownerId} - forfeiting bets`);
+                await settleBlackjackTimeout(state, { interaction, source: 'split', notifyUser: true });
                 blackjackLocks.delete(ownerId);
                 return;
             }
@@ -1698,7 +1841,6 @@ client.on('interactionCreate', async (interaction) => {
                         console.error('❌ Split error for user', ownerId, ':', error);
                         // Refund both the original bet and the split bet
                         await refundBlackjackBet(state, 'split_error');
-                        await refundBlackjackBet(state, 'split_error_original');
                         try { await interaction.followUp({ content: '❌ Error processing split. All bets have been refunded! Please start a new game.', ephemeral: true }); } catch {}
                         // Clean up corrupted game state
                         await deleteBlackjackGame(ownerId);
@@ -1864,7 +2006,7 @@ client.on('interactionCreate', async (interaction) => {
             await changeUserBalance(interaction.user.id, interaction.user.username, -bet, 'blackjack_bet', { bet });
             setCooldown('bj:' + interaction.user.id);
 
-            const state = { userId: interaction.user.id, bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false, split: false, splitHand: null, currentSplitHand: 1 };
+            const state = { userId: interaction.user.id, bet, baseBet: bet, player: [], dealer: [], startedAt: Date.now(), ended: false, channelId: interaction.channelId, messageId: null, shoe: bjCreateShoe(), doubled: false, split: false, splitHand: null, currentSplitHand: 1 };
             
             // MONITORING: Track game start
             if (global.gameMonitoring) {
@@ -2887,6 +3029,7 @@ class BlackjackStateManager {
             }
 
             console.log(`✅ Retrieved valid game for user ${userId}: ${state.player?.length || 0} player, ${state.dealer?.length || 0} dealer`);
+            ensureBlackjackBetDefaults(state);
             return state;
         } catch (error) {
             console.error(`❌ Error retrieving game for user ${userId}:`, error);
@@ -3099,19 +3242,8 @@ setInterval(() => {
                     // Timeout after 15 mins (regular) or 25 mins (split)
                     if ((gameAge > 15 * 60 * 1000 && !state.split) || gameAge > 25 * 60 * 1000) {
                         console.log(`🧹 Cleaning up expired blackjack game for user ${userId}`);
-                        const refundAmount = state.bet * (state.split ? 2 : 1) * (state.doubled ? 2 : 1);
-                        if (refundAmount > 0) {
-                            try {
-                                await changeUserBalance(userId, 'unknown', refundAmount, 'blackjack_refund_cleanup_timeout', {
-                                    bet: state.bet,
-                                    split: state.split,
-                                    doubled: state.doubled
-                                });
-                            } catch (refundError) {
-                                console.error(`Failed to refund user ${userId} during cleanup:`, refundError);
-                            }
-                        }
-                        await deleteBlackjackGame(userId);
+                        state.userId = state.userId || userId;
+                        await settleBlackjackTimeout(state, { source: 'cleanup', notifyUser: false });
                         cleaned++;
                     }
                 } catch (e) {
@@ -3152,16 +3284,17 @@ async function recoverGameState(userId) {
     try {
         const state = await getBlackjackGame(userId);
         if (state) {
+            ensureBlackjackBetDefaults(state);
             if (state.ended) {
                 await deleteBlackjackGame(userId);
                 return null;
             }
             // Check for timeout on recovery
             const gameAge = Date.now() - state.startedAt;
-            if ((gameAge > 15 * 60 * 1000 && !state.split) || gameAge > 25 * 60 * 1000) {
-                await refundBlackjackBet(state, 'timeout_recovered');
-                await deleteBlackjackGame(userId);
-                return null;
+            const timeoutMs = state.split ? 25 * 60 * 1000 : 15 * 60 * 1000;
+            if (gameAge > timeoutMs) {
+                state.timedOut = true;
+                state.timeoutReason = state.split ? 'split' : 'regular';
             }
             return state;
         }
