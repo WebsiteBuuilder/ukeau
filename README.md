@@ -6,7 +6,6 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 
 - 🖼️ **Automatic Vouch Detection**: Requires an image and a mention of a member with the Provider role in a `vouch` channel
 - 📊 **Point Tracking**: SQLite database stored at `/data/vouch_points.db` (persistent on Railway)
-- 🏆 **Leaderboard**: View top 10 users with most vouch points
 - 📈 **Individual Stats**: Check your own or others' vouch points
 - 🚀 **Multiplier Mode**: Global multiplier (1x default) for boosted vouch events
 - 🛡️ **Admin Tools**: Add/remove points, set/reset multiplier
@@ -14,7 +13,6 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 
 ## Commands
 
-- `/leaderboard` - Show top users with the most vouch points
 - `/vouchpoints [user]` - See your own or another user's vouch points
 - `/addpoints @user X` - Admin: add X points
 - `/removepoints @user X` - Admin: remove X points
@@ -69,7 +67,7 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 4. Create a new project and select your repository
 5. Add environment variables:
    - `DISCORD_TOKEN`: Your Discord bot token
-   - `DATABASE_PATH`: `/data/vouch_points.db` (for persistent storage)
+   - `DB_PATH` (optional): Path to SQLite database file. Defaults to `/data/vouch_points.db` when that directory exists.
    - `PROVIDER_ROLE_ID` or `PROVIDER_ROLE_NAME` (one is required for provider check)
 6. Deploy!
 
@@ -79,7 +77,7 @@ A Discord bot that rewards users with vouch points for posting pictures in chann
 2. **Image Validation**: Checks if uploaded files are images (JPEG, PNG, GIF, WebP)
 3. **Point Award**: Automatically awards 1 vouch point per image posted
 4. **Database Storage**: Uses SQLite to persistently store user points
-5. **Commands**: Users can check their points and view leaderboards
+5. **Commands**: Users can check their points and manage settings via slash commands
 
 ## File Structure
 
@@ -96,7 +94,7 @@ ukeau/
 ## Environment Variables
 
 - `DISCORD_TOKEN` (required): Your Discord bot token
-- `DATABASE_PATH` (optional): Path to SQLite database file (defaults to `/data/vouch_points.db` for Railway persistent storage)
+- `DB_PATH` (optional): Path to SQLite database file (defaults to `/data/vouch_points.db` when available)
 
 ## Database Schema
 
