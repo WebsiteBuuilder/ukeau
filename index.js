@@ -15,7 +15,13 @@ const client = new Client({
 });
 
 // Initialize SQLite database with persistent storage path
-const dbPath = process.env.DB_PATH || './vouch_points.db';
+const dbPath = (() => {
+    if (process.env.DB_PATH) return process.env.DB_PATH;
+    if (fs.existsSync('/data')) {
+        return path.join('/data', 'vouch_points.db');
+    }
+    return path.resolve('./vouch_points.db');
+})();
 // Ensure directory exists (Railway persistent volume: /data)
 try {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -26,7 +32,7 @@ try {
 // Migrate legacy DB from project root to /data if present and destination missing
 try {
     const legacyPath = path.resolve('./vouch_points.db');
-    if (!fs.existsSync(dbPath) && fs.existsSync(legacyPath)) {
+    if (dbPath !== legacyPath && !fs.existsSync(dbPath) && fs.existsSync(legacyPath)) {
         fs.copyFileSync(legacyPath, dbPath);
         console.log('➡️  Migrated legacy database to', dbPath);
     }
@@ -1070,20 +1076,10 @@ client.once('ready', async () => {
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
 
-    // Set up periodic leaderboard updates (every 30 minutes)
-    setInterval(async () => {
-        try {
-            await updateLiveLeaderboard(client);
-        } catch (error) {
-            console.error('Periodic leaderboard update error:', error);
-        }
-    }, 30 * 60 * 1000); // 30 minutes
-
     // Set up game state cleanup (every 10 minutes - less aggressive)
     // Legacy in-memory cleanup removed; DB-backed cleanup is handled elsewhere
     // setInterval(() => { /* removed bjGames cleanup */ }, 10 * 60 * 1000);
 
-    console.log('📊 Live leaderboard system initialized - updates every 30 minutes');
     console.log('🧹 Game cleanup system initialized - runs every 10 minutes');
 
     // Set up daily database backup (every 24 hours)
@@ -1185,14 +1181,6 @@ client.once('ready', async () => {
                     required: false
                 }
             ]
-        },
-        { name: 'leaderboard', description: 'View the vouch points leaderboard', dm_permission: true },
-        { name: 'casinoleaderboard', description: 'View casino net winners leaderboard' },
-        {
-            name: 'updateleaderboard',
-            description: 'Admin: Force update the live leaderboard in #leaderboard channel',
-            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
-            dm_permission: false
         },
         {
             name: 'blackjack',
@@ -1399,10 +1387,6 @@ async function awardVouchPoint(message) {
                     
                     const newPoints = row.points + pointsToAdd;
                     sendVouchAwardMessage(message, username, pointsToAdd, newPoints);
-                    // Update live leaderboard
-                    if (client) {
-                        updateLiveLeaderboard(client).catch(err => console.error('Leaderboard update error:', err));
-                    }
                     resolve(newPoints);
                 });
             } else {
@@ -1415,10 +1399,6 @@ async function awardVouchPoint(message) {
                     }
                     
                     sendVouchAwardMessage(message, username, pointsToAdd, pointsToAdd);
-                    // Update live leaderboard
-                    if (client) {
-                        updateLiveLeaderboard(client).catch(err => console.error('Leaderboard update error:', err));
-                    }
                     resolve(pointsToAdd);
                 });
             }
@@ -1474,127 +1454,6 @@ async function get24HourTopWinner() {
 }
 
 // Legacy in-memory recoverGameState removed; using async DB-backed version defined later
-
-// Function to update live leaderboard in #leaderboard channel
-async function updateLiveLeaderboard(client) {
-    try {
-        // Find the leaderboard channel using environment variable or by name
-        let leaderboardChannel = null;
-
-        if (process.env.LEADERBOARD_CHANNEL_ID) {
-            leaderboardChannel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID).catch(() => null);
-        }
-
-        // Fallback to finding by name if ID not found
-        if (!leaderboardChannel) {
-            leaderboardChannel = client.channels.cache.find(ch =>
-                ch.name.toLowerCase() === 'leaderboard' && ch.type === 0
-            );
-        }
-
-        if (!leaderboardChannel) {
-            console.log('Leaderboard channel not found. Set LEADERBOARD_CHANNEL_ID or ensure #leaderboard channel exists.');
-            return;
-        }
-
-        // Get leaderboard data
-        const leaderboardData = await new Promise((resolve, reject) => {
-            db.all('SELECT user_id, points, username FROM vouch_points ORDER BY points DESC LIMIT 20', [], (err, rows) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                resolve(rows || []);
-            });
-        });
-
-        if (leaderboardData.length === 0) {
-            console.log('No leaderboard data available.');
-            return;
-        }
-
-        // Create enhanced leaderboard embed with glassmorphism theme
-        const embed = new EmbedBuilder()
-            .setColor('#0f0f23')
-            .setTitle('🏆 LIVE VOUCH POINTS LEADERBOARD 🏆')
-            .setDescription('```\n╔════════════════════════════════════════╗\n║     💎 REAL-TIME RANKINGS 💎           ║\n║        Updated Automatically!          ║\n╚════════════════════════════════════════╝```')
-            .setTimestamp()
-            .setFooter({ 
-                text: `🔄 Auto-updates every 30 minutes • Last updated`, 
-                iconURL: client.user?.displayAvatarURL() 
-            });
-
-        // Split into top 10 and next 10 for better formatting
-        const top10 = leaderboardData.slice(0, 10);
-        const next10 = leaderboardData.slice(10, 20);
-
-        let top10Text = '';
-        for (let i = 0; i < top10.length; i++) {
-            const { user_id, points, username } = top10[i];
-            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : 
-                         i === 3 ? '🏅' : i === 4 ? '🎖️' : '🔹';
-            const displayName = username || 'Unknown User';
-            const pointsDisplay = points.toLocaleString();
-            top10Text += `${medal} **#${i + 1}** <@${user_id}> • **${pointsDisplay}** pts\n`;
-        }
-
-        embed.addFields({
-            name: '🏆 TOP 10 CHAMPIONS',
-            value: top10Text || 'No points awarded yet!',
-            inline: false
-        });
-
-        if (next10.length > 0) {
-            let next10Text = '';
-            for (let i = 0; i < next10.length; i++) {
-                const { user_id, points, username } = next10[i];
-                const rank = i + 11;
-                const pointsDisplay = points.toLocaleString();
-                next10Text += `🔸 **#${rank}** <@${user_id}> • **${pointsDisplay}** pts\n`;
-            }
-            embed.addFields({
-                name: '⭐ RISING STARS (11-20)',
-                value: next10Text,
-                inline: false
-            });
-        }
-
-        // Add total stats
-        const totalUsers = leaderboardData.length;
-        const totalPoints = leaderboardData.reduce((sum, user) => sum + user.points, 0);
-        embed.addFields({
-            name: '📊 SERVER STATS',
-            value: `👥 **${totalUsers}** Active Users • 💰 **${totalPoints.toLocaleString()}** Total Points`,
-            inline: false
-        });
-
-        // Try to find existing leaderboard message
-        let existingMessage = null;
-        try {
-            const messages = await leaderboardChannel.messages.fetch({ limit: 50 });
-            existingMessage = messages.find(msg =>
-                msg.author.id === client.user.id &&
-                msg.embeds.length > 0 &&
-                (msg.embeds[0].title === '🏆 Live Vouch Points Leaderboard' || 
-                 msg.embeds[0].title === '🏆 LIVE VOUCH POINTS LEADERBOARD 🏆')
-            );
-        } catch (error) {
-            console.log('Error fetching messages:', error.message);
-        }
-
-        // Update or create the leaderboard message
-        if (existingMessage) {
-            await existingMessage.edit({ embeds: [embed] });
-            console.log('✅ Updated existing leaderboard message');
-        } else {
-            await leaderboardChannel.send({ embeds: [embed] });
-            console.log('✅ Created new leaderboard message');
-        }
-
-    } catch (error) {
-        console.error('Error updating live leaderboard:', error);
-    }
-}
 
 // Function to send vouch award message
 function sendVouchAwardMessage(message, username, pointsAwarded, totalPoints) {
@@ -1968,8 +1827,6 @@ client.on('interactionCreate', async (interaction) => {
                         return;
                     }
                     interaction.reply({ content: `Updated ${targetUser.username}'s points to ${newPoints}.` });
-                    // Update live leaderboard
-                    updateLiveLeaderboard(interaction.client).catch(err => console.error('Leaderboard update error:', err));
                 });
             } else {
                 const initial = Math.max(0, delta);
@@ -1980,8 +1837,6 @@ client.on('interactionCreate', async (interaction) => {
                         return;
                     }
                     interaction.reply({ content: `Set ${targetUser.username}'s points to ${initial}.` });
-                        // Update live leaderboard
-                        updateLiveLeaderboard(interaction.client).catch(err => console.error('Leaderboard update error:', err));
                 });
             }
         });
@@ -2385,29 +2240,6 @@ client.on('interactionCreate', async (interaction) => {
         }
         return;
     }
-
-    // Casino leaderboard
-    if (interaction.commandName === 'casinoleaderboard') {
-        try {
-            db.all("SELECT user_id, SUM(delta) AS net FROM ledger WHERE reason LIKE 'blackjack_%' OR reason LIKE 'roulette_%' OR reason LIKE 'slots_%' GROUP BY user_id ORDER BY net DESC LIMIT 10", [], async (err, rows) => {
-                if (err) { console.error('Ledger query error:', err); await interaction.reply({ content: '❌ Error.', ephemeral: true }); return; }
-                if (!rows || rows.length === 0) { await interaction.reply({ content: 'No casino activity yet.', ephemeral: true }); return; }
-                let text = '';
-                for (let i = 0; i < rows.length; i++) {
-                    const { user_id, net } = rows[i];
-                    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
-                    text += `${medal} <@${user_id}> — ${net >= 0 ? '+' : ''}${net}\n`;
-                }
-                const embed = new EmbedBuilder().setColor('#ffd700').setTitle('🏆 Casino Leaderboard').setDescription(text);
-                await interaction.reply({ embeds: [embed] });
-            });
-        } catch (e) {
-            console.error('Casino leaderboard error:', e);
-            try { await interaction.reply({ content: '❌ Error.', ephemeral: true }); } catch {}
-        }
-        return;
-    }
-
     if (interaction.commandName === 'recountvouches') {
         if (!interaction.inGuild()) {
             interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
@@ -2598,13 +2430,6 @@ client.on('interactionCreate', async (interaction) => {
             });
 
             await interaction.editReply(`✅ Backup restored from ${date}! Restored ${backup.data.length} users with ${backup.totalPoints} total points.`);
-            
-            // Update leaderboard after restore
-            try {
-                await updateLiveLeaderboard(interaction.client);
-            } catch (e) {
-                console.error('Leaderboard update after restore failed:', e);
-            }
         } catch (e) {
             console.error('Backup restore error:', e);
             await interaction.editReply('❌ Error during backup restore. Check logs.');
@@ -2692,66 +2517,6 @@ client.on('interactionCreate', async (interaction) => {
             }
             interaction.reply({ content: '🧹 All vouch points have been wiped.' });
         });
-    }
-    if (interaction.commandName === 'vouchleaderboard' || interaction.commandName === 'leaderboard') {
-        db.all('SELECT user_id, points, username FROM vouch_points ORDER BY points DESC LIMIT 10', [], (err, rows) => {
-            if (err) {
-                console.error('Database error:', err);
-                interaction.reply({ content: '❌ Error retrieving leaderboard!', ephemeral: true });
-                return;
-            }
-            
-            if (rows.length === 0) {
-                interaction.reply({ content: '📊 No vouch points have been awarded yet!', ephemeral: true });
-                return;
-            }
-            
-            let leaderboardText = '';
-            for (let i = 0; i < rows.length; i++) {
-                const { user_id, points, username } = rows[i];
-                const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔸';
-                // Use mention to always resolve current display name; still show points
-                leaderboardText += `${medal} **${i + 1}.** <@${user_id}> - ${points} points\n`;
-                // Backfill username in DB if missing
-                if (!username) {
-                    client.users.fetch(user_id).then(u => {
-                        if (u && u.username) {
-                            db.run('UPDATE vouch_points SET username = ? WHERE user_id = ?', [u.username, user_id], () => {});
-                        }
-                    }).catch(() => {});
-                }
-            }
-            
-            const embed = new EmbedBuilder()
-                .setColor('#ffd700')
-                .setTitle('🏆 Vouch Points Leaderboard')
-                .setDescription(leaderboardText)
-                .setTimestamp();
-            
-            interaction.reply({ embeds: [embed] });
-        });
-    }
-
-    if (interaction.commandName === 'updateleaderboard') {
-        if (!interaction.inGuild()) {
-            interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
-            return;
-        }
-        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) || interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-        if (!isAdmin) {
-            interaction.reply({ content: '❌ You do not have permission to use this command.', ephemeral: true });
-            return;
-        }
-
-        await interaction.deferReply({ ephemeral: true });
-
-        try {
-            await updateLiveLeaderboard(interaction.client);
-            await interaction.editReply('✅ Live leaderboard has been updated in the #leaderboard channel!');
-    } catch (error) {
-            console.error('Manual leaderboard update error:', error);
-            await interaction.editReply('❌ Error updating leaderboard. Check the console for details.');
-        }
     }
 
     // Handle /sendpoints and /pay command (alias)
@@ -3271,10 +3036,6 @@ setInterval(() => {
         }
     })();
 }, 60 * 1000 * 5); // every 5 minutes
-
-// ================================================================================= //
-// LIVE LEADERBOARD
-// ================================================================================= //
 
 // ================================================================================= //
 // GAME UTILITIES
