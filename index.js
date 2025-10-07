@@ -1470,7 +1470,9 @@ client.once('ready', async () => {
         {
             name: 'blackjack',
             description: 'Play blackjack against the dealer',
-            default_member_permissions: null,
+            // Explicitly set default permissions to "0" (everyone) to override any
+            // previously cached admin-only settings for this command.
+            default_member_permissions: '0',
             dm_permission: false,
             options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
         },
