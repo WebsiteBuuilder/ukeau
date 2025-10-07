@@ -68,13 +68,6 @@ db.serialize(() => {
         game_state TEXT NOT NULL,
         last_updated INTEGER NOT NULL
     )`);
-    db.run('CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)');
-    db.run('CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON ledger(timestamp)');
-    
-    // Migration: Ensure ledger has all required columns for existing databases
-    db.run("ALTER TABLE ledger ADD COLUMN username TEXT", () => {}); // Ignore error if exists
-    db.run("ALTER TABLE ledger ADD COLUMN balance INTEGER", () => {}); // Ignore error if exists  
-    db.run("ALTER TABLE ledger ADD COLUMN metadata TEXT", () => {}); // Ignore error if exists
 });
 
 // Ensure username column exists on vouch_points (for persistent display names)
@@ -96,30 +89,94 @@ function ensureUsernameColumn() {
     });
 }
 
-function ensureLedgerTimestampColumn() {
-    return new Promise((resolve) => {
-        db.all("PRAGMA table_info(ledger)", (err, rows) => {
+let ledgerSchemaReadyPromise = null;
+let ledgerSchemaLastRetry = 0;
+
+function ensureLedgerReady(force = false) {
+    if (!ledgerSchemaReadyPromise || force) {
+        ledgerSchemaReadyPromise = ensureLedgerSchema();
+    }
+    return ledgerSchemaReadyPromise;
+}
+
+async function ensureLedgerSchema() {
+    const getLedgerInfo = () => new Promise((resolve) => {
+        db.all('PRAGMA table_info(ledger)', (err, rows) => {
             if (err) {
                 console.error('PRAGMA ledger info error:', err);
-                resolve();
+                resolve([]);
                 return;
             }
-            const hasTimestamp = rows?.some(r => String(r.name).toLowerCase() === 'timestamp');
-            if (hasTimestamp) {
-                resolve();
-                return;
-            }
-            db.run("ALTER TABLE ledger ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP", (e2) => {
-                if (e2) {
-                    console.warn('Could not add ledger.timestamp column (may already exist):', e2.message);
-                } else {
-                    console.log('✅ Added missing ledger.timestamp column for historical entries.');
-                }
-                resolve();
-            });
+            resolve(rows || []);
         });
     });
+
+    const runMigration = (sql, successMessage) => new Promise((resolve) => {
+        db.run(sql, (err) => {
+            if (err) {
+                const message = err.message || '';
+                if (!/duplicate column name|already exists/i.test(message)) {
+                    console.error(`Ledger schema migration error for "${sql.trim()}"`, err);
+                }
+                resolve(false);
+                return;
+            }
+            if (successMessage) {
+                console.log(successMessage);
+            }
+            resolve(true);
+        });
+    });
+
+    try {
+        const initialInfo = await getLedgerInfo();
+        const initialColumns = new Set(initialInfo.map((row) => String(row.name).toLowerCase()));
+
+        if (!initialColumns.has('username')) {
+            await runMigration('ALTER TABLE ledger ADD COLUMN username TEXT', '✅ Added missing ledger.username column.');
+        }
+        if (!initialColumns.has('balance')) {
+            await runMigration('ALTER TABLE ledger ADD COLUMN balance INTEGER', '✅ Added missing ledger.balance column.');
+        }
+        if (!initialColumns.has('metadata')) {
+            await runMigration('ALTER TABLE ledger ADD COLUMN metadata TEXT', '✅ Added missing ledger.metadata column.');
+        }
+        if (!initialColumns.has('timestamp')) {
+            await runMigration('ALTER TABLE ledger ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP', '✅ Added missing ledger.timestamp column for historical entries.');
+        }
+
+        const finalInfo = await getLedgerInfo();
+        const finalColumns = new Set(finalInfo.map((row) => String(row.name).toLowerCase()));
+
+        await runMigration('CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)');
+        if (finalColumns.has('timestamp')) {
+            await runMigration('CREATE INDEX IF NOT EXISTS idx_ledger_timestamp ON ledger(timestamp)');
+        } else {
+            console.error('⚠️ ledger.timestamp column is missing; timestamp-dependent features will be disabled.');
+        }
+
+        return finalColumns.has('timestamp');
+    } catch (error) {
+        console.error('Ledger schema ensure failure:', error);
+        return false;
+    }
 }
+
+async function requireLedgerTimestamp() {
+    let hasTimestamp = await ensureLedgerReady();
+    if (!hasTimestamp) {
+        const now = Date.now();
+        if (now - ledgerSchemaLastRetry > 60 * 1000) {
+            ledgerSchemaLastRetry = now;
+            console.warn('ledger.timestamp column unavailable after migration. Retrying migration.');
+            hasTimestamp = await ensureLedgerReady(true);
+        }
+    }
+    return hasTimestamp;
+}
+
+// Kick off schema validation immediately so that legacy databases are migrated ASAP.
+ensureLedgerReady();
 
 // Bot ready event
 // Settings helpers
@@ -525,10 +582,12 @@ function formatChipAmount(value) {
 }
 
 async function getBlackjackLedgerTrail(userId) {
+    const hasTimestamp = await requireLedgerTimestamp();
+    const timestampSelection = hasTimestamp ? 'timestamp' : 'NULL as timestamp';
     try {
         const lastBet = await new Promise((resolve, reject) => {
             db.get(
-                `SELECT id, timestamp, delta, metadata FROM ledger
+                `SELECT id, delta, metadata, ${timestampSelection} FROM ledger
                  WHERE user_id = ? AND reason = 'blackjack_bet'
                  ORDER BY id DESC
                  LIMIT 1`,
@@ -548,7 +607,7 @@ async function getBlackjackLedgerTrail(userId) {
 
         const subsequent = await new Promise((resolve, reject) => {
             db.all(
-                `SELECT id, reason, delta, metadata, timestamp FROM ledger
+                `SELECT id, reason, delta, metadata, ${timestampSelection} FROM ledger
                  WHERE user_id = ? AND id > ?
                  ORDER BY id ASC`,
                 [userId, lastBet.id],
@@ -1268,7 +1327,7 @@ client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
     await ensureUsernameColumn();
-    await ensureLedgerTimestampColumn();
+    await ensureLedgerReady();
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
 
@@ -1635,6 +1694,13 @@ async function get24HourTopWinner() {
         return winnerCache.data;
     }
 
+    const hasTimestamp = await requireLedgerTimestamp();
+    if (!hasTimestamp) {
+        console.warn('Skipping 24-hour winner query because ledger.timestamp column is unavailable.');
+        winnerCache = { data: null, timestamp: 0 };
+        return null;
+    }
+
     return new Promise((resolve, reject) => {
         // Get current time minus 24 hours
         const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
@@ -1691,6 +1757,7 @@ function sendVouchAwardMessage(message, username, pointsAwarded, totalPoints) {
 
 // Slash command to check vouch points
 client.on('interactionCreate', async (interaction) => {
+    await ensureLedgerReady();
     // Handle Blackjack buttons
     if (interaction.isButton()) {
         try {
@@ -2899,11 +2966,14 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply({ ephemeral: true });
 
         try {
+            const hasTimestamp = await requireLedgerTimestamp();
+            const timestampSelection = hasTimestamp ? 'timestamp' : 'NULL as timestamp';
+            const orderClause = hasTimestamp ? 'ORDER BY timestamp DESC' : 'ORDER BY id DESC';
             const transactions = await new Promise((resolve, reject) => {
                 db.all(
-                    `SELECT delta, reason, metadata, timestamp FROM ledger
+                    `SELECT delta, reason, metadata, ${timestampSelection} FROM ledger
                      WHERE user_id = ?
-                     ORDER BY timestamp DESC
+                     ${orderClause}
                      LIMIT ?`,
                     [targetUser.id, limit],
                     (err, rows) => {
@@ -2921,7 +2991,11 @@ client.on('interactionCreate', async (interaction) => {
             let response = `📊 **Recent Transactions for ${targetUser.username}:**\n\n`;
 
             for (const tx of transactions) {
-                const timestamp = new Date(tx.timestamp).toLocaleString();
+                let timestamp = 'Unknown time';
+                if (tx.timestamp) {
+                    const parsed = new Date(tx.timestamp);
+                    timestamp = Number.isNaN(parsed.getTime()) ? String(tx.timestamp) : parsed.toLocaleString();
+                }
                 const delta = tx.delta > 0 ? `+${tx.delta}` : tx.delta;
                 const reason = tx.reason.replace(/_/g, ' ').toUpperCase();
 
