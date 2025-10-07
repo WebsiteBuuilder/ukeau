@@ -162,6 +162,87 @@ async function ensureLedgerSchema() {
     }
 }
 
+// Recent blackjack players cache (for dynamic tips)
+let recentPlayersCache = { names: [], timestamp: 0 };
+
+async function getRecentBlackjackPlayers(limit = 12, sinceHours = 72) {
+    const now = Date.now();
+    // Cache for 60 seconds to avoid frequent DB hits
+    if (recentPlayersCache.names.length > 0 && (now - recentPlayersCache.timestamp) < 60 * 1000) {
+        return recentPlayersCache.names.slice(0, limit);
+    }
+
+    const hasTimestamp = await requireLedgerTimestamp();
+    const params = [];
+    let sql = `SELECT username${hasTimestamp ? ', timestamp' : ''}
+               FROM ledger
+               WHERE reason LIKE 'blackjack_%'`;
+    if (hasTimestamp) {
+        // Filter to last N hours only when timestamp is available
+        const cutoff = new Date(now - sinceHours * 60 * 60 * 1000).toISOString().replace('T', ' ').replace('Z', '');
+        sql += ` AND timestamp >= ?`;
+        params.push(cutoff);
+    }
+    sql += ` ORDER BY ${hasTimestamp ? 'timestamp' : 'id'} DESC LIMIT 200`;
+
+    const rows = await new Promise((resolve) => {
+        db.all(sql, params, (err, r) => {
+            if (err) { console.error('recent players query failed:', err); resolve([]); return; }
+            resolve(r || []);
+        });
+    });
+
+    const seen = new Set();
+    const names = [];
+    for (const row of rows) {
+        const name = (row && row.username) ? String(row.username).trim() : '';
+        if (name && !seen.has(name.toLowerCase())) {
+            seen.add(name.toLowerCase());
+            names.push(name);
+            if (names.length >= limit) break;
+        }
+    }
+
+    recentPlayersCache = { names, timestamp: now };
+    return names;
+}
+
+function randomDogmandoFact() {
+    const facts = [
+        'Dogmando Fact: crowned greatest blackjack player of the lounge.',
+        'Dogmando Fact: once split aces so hard the lights flickered.',
+        'Dogmando Fact: counts cards by scent alone.',
+        'Dogmando Fact: believes soft 18 is a promise, not a number.',
+        'Dogmando Fact: the dealer calls him "sir".',
+        'Dogmando Lore: averagebmwdriver once drifted past the pit; Dogmando hit 21 in the reflection.',
+        'Dogmando Lore: every trophy has a chew mark—quality assurance.',
+        'Dogmando Lore: the lounge was built around his favorite seat.',
+        'Dogmando Tip: push is a pause—the story continues next hand.'
+    ];
+    return facts[Math.floor(Math.random() * facts.length)];
+}
+
+function buildBlackjackPrompt(recentPlayers = []) {
+    const someone = recentPlayers.length ? recentPlayers[Math.floor(Math.random() * recentPlayers.length)] : null;
+    const prompts = [
+        'Your move: Hit, Stand, Double, or Surrender.',
+        'Dealer waits. You decide: Hit, Stand, Double, or Surrender.',
+        'Choose your line: Hit • Stand • Double • Surrender.',
+        'Trust your gut—Hit, Stand, Double, or Surrender.',
+        'The felt is quiet. Hit? Stand? Double? Surrender?',
+        'Odds whisper: Hit, Stand, Double, Surrender—pick your path.',
+        'Momentum favors the bold. Hit, Stand, Double, or Surrender.',
+        'The shoe runs deep. Hit, Stand, Double, or Surrender.',
+        someone ? `${someone} watched this spot catch fire last night—Hit, Stand, Double, or Surrender.` : null,
+        someone ? `A legend grows when ${someone} hits the right card—your turn.` : null,
+        'Dogmando watches with a grin. Hit, Stand, Double, or Surrender.',
+        'Silence from the dealer; thunder from your choice. Hit, Stand, Double, or Surrender.',
+        'Soft hand? Hard choice. Hit, Stand, Double, or Surrender.',
+        'Let the table hear your story—Hit, Stand, Double, or Surrender.'
+    ].filter(Boolean);
+    return prompts[Math.floor(Math.random() * prompts.length)];
+}
+
 async function requireLedgerTimestamp() {
     let hasTimestamp = await ensureLedgerReady();
     if (!hasTimestamp) {
@@ -919,21 +1000,58 @@ function bjBuildEmbed(state, opts = {}) {
 
     const description = descriptionParts.filter(Boolean).join('\n');
 
-    const activeQuips = [
-        'Dogmando whispers, "Split eights. Trust me, I\'m the lounge legend."',
-        'Dogmando flexes: "I hit 21 before the dealer finished shuffling."',
-        'Dogmando taps the felt: "Double downs are hugs with extra chips."'
-    ];
-    const finishedQuips = [
-        'Dogmando logs another win in his hall-of-fame chew toy.',
-        'Dogmando howls, "Even my naps count as victories."',
-        'Dogmando polishes the trophy: "Another challenger, another story."'
-    ];
-    const quipPool = state.ended ? finishedQuips : activeQuips;
-    const seedSource = `${state.userId || ''}${state.startedAt || 0}`;
-    let seed = 0;
-    for (const ch of seedSource) seed = (seed + ch.charCodeAt(0)) % 2147483647;
-    const quip = quipPool.length ? quipPool[seed % quipPool.length] : 'Dogmando watches silently, plotting his next blackjack masterpiece.';
+	// Build a rich pool of Dogmando quips with heavy variance and community lore
+	const recentNames = Array.isArray(opts.recentPlayers) ? opts.recentPlayers : [];
+	const someone = recentNames.length ? recentNames[Math.floor(Math.random() * recentNames.length)] : null;
+
+	const coreActive = [
+		'Dogmando whispers, "Split eights. Trust me, I\'m the lounge legend."',
+		'Dogmando flexes: "I hit 21 before the dealer finished shuffling."',
+		'Dogmando taps the felt: "Double downs are hugs with extra chips."',
+		'Dogmando squints at the dealer: "Seventeen is just a warm-up lap."',
+		'Dogmando slides shades on: "Soft hands, hard choices. Be brave."',
+		'Dogmando grins: "Aces love company. Invite another to the party."',
+		'Dogmando points at the shoe: "Card counting? I call it snack tracking."',
+		'Dogmando nods: "Dealer shows six? Let gravity do the work."',
+		'Dogmando: "Hitting on a soft seventeen is like chasing squirrels—timing is everything."'
+	];
+	const communityActive = [
+		someone ? `Dogmando barks: "${someone}, the lounge is watching. Make it stylish."` : null,
+		someone ? `Dogmando winks at ${someone}: "Split or stand—either way, write a legend."` : null,
+		someone ? `Dogmando: "${someone} once doubled here and the lights dimmed in respect."` : null,
+		'Dogmando circles the table: "House edge? I call it house pledge."',
+		'Dogmando: "Hard sixteen vs a ten? The bravest surrender wins tomorrow."'
+	].filter(Boolean);
+	const bmwLoreActive = [
+		'Dogmando side-eyes the valet: "averagebmwdriver parked on the sidewalk again."',
+		'Dogmando adjusts his collar: "averagebmwdriver revs louder when the dealer shows an Ace."',
+		'Dogmando laughs: "If the hand is fast, it\'s because averagebmwdriver took the scenic route to 21."'
+	];
+
+	const coreFinished = [
+		'Dogmando logs another win in his hall-of-fame chew toy.',
+		'Dogmando howls, "Even my naps count as victories."',
+		'Dogmando polishes the trophy: "Another challenger, another story."',
+		'Dogmando stacks chips like bones: "Some days the shoe begs for mercy."',
+		'Dogmando yawns: "Pushes are just intermissions between victories."'
+	];
+	const communityFinished = [
+		someone ? `Dogmando scribbles: "${someone} left their mark on the felt tonight."` : null,
+		someone ? `Dogmando raises a paw to ${someone}: "Chips won, tale told."` : null,
+		'Dogmando signs the ledger: "Luck favors the bold—and the prepared."'
+	].filter(Boolean);
+	const bmwLoreFinished = [
+		'Dogmando nods: "Legend says averagebmwdriver once hit 21 without looking. The valet confirmed."',
+		'Dogmando smirks: "If the house tilts, it\'s just averagebmwdriver drifting past."'
+	];
+
+	const activeQuips = [...coreActive, ...communityActive, ...bmwLoreActive];
+	const finishedQuips = [...coreFinished, ...communityFinished, ...bmwLoreFinished];
+	const quipPool = state.ended ? finishedQuips : activeQuips;
+	const seedSource = `${state.userId || ''}${state.startedAt || 0}${(someone || '').length}`;
+	let seed = 0;
+	for (const ch of seedSource) seed = (seed + ch.charCodeAt(0)) % 2147483647;
+	const quip = quipPool.length ? quipPool[seed % quipPool.length] : 'Dogmando watches silently, plotting his next blackjack masterpiece.';
 
     let embedColor = 0x5e3bff;
     if (state.split) embedColor = 0x7f27ff;
@@ -954,7 +1072,7 @@ function bjBuildEmbed(state, opts = {}) {
             { name: '🐕‍🦺 Dogmando\'s Tip', value: `> _${quip}_`, inline: true },
             { name: '​', value: '​', inline: true }
         )
-        .setFooter({ text: 'Dogmando Fact: crowned greatest blackjack player of the lounge.' });
+		.setFooter({ text: randomDogmandoFact() });
 
     return embed;
 }
@@ -1036,6 +1154,9 @@ async function bjUpdateView(state, opts = {}, interaction = null) {
     // Pass jackpot for header display
     if (!Object.prototype.hasOwnProperty.call(opts, 'jackpot')) {
         try { opts.jackpot = await getSlotsJackpot(); } catch {}
+    }
+    if (!opts.recentPlayers) {
+        try { opts.recentPlayers = await getRecentBlackjackPlayers(); } catch {}
     }
     const embed = bjBuildEmbed(state, opts);
     await updateGame(interaction, state, { embeds: [embed], components: bjComponents(state) });
@@ -1156,7 +1277,8 @@ async function bjResolve(interaction, state, action, fromTimeout = false) {
     lines.push(resultText);
     lines.push(`\n${resultBanner}`);
     
-    const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
+    const recentPlayers = await getRecentBlackjackPlayers();
+    const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}`, recentPlayers });
     await updateGame(interaction, state, { embeds: [embed], components: [] });
 
     if (payout > 0) {
@@ -1232,7 +1354,8 @@ async function settleBlackjackTimeout(state, { interaction = null, source = 'tim
         lines.push('Please start a new `/blackjack` game when you are ready.');
 
         try {
-            const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}`, result: '💔 TIMEOUT FORFEIT 💔' });
+            const recentPlayers = await getRecentBlackjackPlayers();
+            const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}`, result: '💔 TIMEOUT FORFEIT 💔', recentPlayers });
             await updateGame(interaction, state, { embeds: [embed], components: [] });
         } catch (e) {
             console.error('Failed to update timed-out blackjack message:', e);
@@ -1303,7 +1426,8 @@ async function bjResolveSplit(interaction, state, action, fromTimeout = false) {
                         '💔 SPLIT LOSS 💔';
     lines.push(`\n${resultBanner}`);
 
-    const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}` });
+    const recentPlayers = await getRecentBlackjackPlayers();
+    const embed = bjBuildEmbed(state, { note: `\n${lines.join('\n')}`, recentPlayers });
     await updateGame(interaction, state, { embeds: [embed], components: [] });
 
     if (totalPayout > 0) {
@@ -2274,11 +2398,13 @@ client.on('interactionCreate', async (interaction) => {
 
             // Get 24-hour top winner for display
             const topWinner = await get24HourTopWinner();
+            const recentPlayers = await getRecentBlackjackPlayers();
             const initialEmbed = bjBuildEmbed(state, {
                 hideDealerHole: true,
-                note: '\nYour move: Hit, Stand, Double, or Surrender.',
+                note: `\n${buildBlackjackPrompt(recentPlayers)}`,
                 topWinner: topWinner,
-                jackpot: await getSlotsJackpot()
+                jackpot: await getSlotsJackpot(),
+                recentPlayers
             });
             const components = [
                 {
