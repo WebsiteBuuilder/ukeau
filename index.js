@@ -1183,6 +1183,28 @@ client.once('ready', async () => {
             ]
         },
         {
+            name: 'leaderboard',
+            description: 'View the top vouch point holders on the server',
+            dm_permission: false,
+            options: [
+                {
+                    name: 'limit',
+                    description: 'How many users to show (max 25)',
+                    type: 4,
+                    required: false,
+                    min_value: 1,
+                    max_value: 25
+                },
+                {
+                    name: 'page',
+                    description: 'Which page of the leaderboard to view',
+                    type: 4,
+                    required: false,
+                    min_value: 1
+                }
+            ]
+        },
+        {
             name: 'blackjack',
             description: 'Play blackjack against the dealer',
             options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
@@ -1752,7 +1774,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'vouchpoints') {
         const targetUser = interaction.options.getUser('user') || interaction.user;
         const isOwnPoints = targetUser.id === interaction.user.id;
-        
+
         db.get('SELECT points, username FROM vouch_points WHERE user_id = ?', [targetUser.id], (err, row) => {
             if (err) {
                 console.error('Database error:', err);
@@ -1794,7 +1816,100 @@ client.on('interactionCreate', async (interaction) => {
             });
         });
     }
-    
+
+    if (interaction.commandName === 'leaderboard') {
+        try {
+            const limitInput = interaction.options.getInteger('limit');
+            const pageInput = interaction.options.getInteger('page');
+            const limit = Math.max(1, Math.min(25, limitInput || 10));
+            let page = Math.max(1, pageInput || 1);
+
+            const totalRow = await new Promise((resolve, reject) => {
+                db.get('SELECT COUNT(*) AS total FROM vouch_points', (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row || { total: 0 });
+                });
+            });
+
+            const totalEntries = totalRow?.total || 0;
+            if (totalEntries === 0) {
+                await interaction.reply({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor('#ffd700')
+                            .setTitle('🏆 Vouch Leaderboard')
+                            .setDescription('No vouch points have been earned yet. Be the first to post in the vouch channels!')
+                            .setTimestamp()
+                    ],
+                    allowedMentions: { parse: [] }
+                });
+                return;
+            }
+
+            const totalPages = Math.max(1, Math.ceil(totalEntries / limit));
+            if (page > totalPages) page = totalPages;
+            const offset = (page - 1) * limit;
+
+            const rows = await new Promise((resolve, reject) => {
+                db.all(
+                    'SELECT user_id, points, username FROM vouch_points ORDER BY points DESC LIMIT ? OFFSET ?',
+                    [limit, offset],
+                    (err, data) => {
+                        if (err) reject(err);
+                        else resolve(data || []);
+                    }
+                );
+            });
+
+            const lines = rows.map((row, idx) => {
+                const rank = offset + idx + 1;
+                const displayName = row.username || 'Unknown User';
+                const youNote = row.user_id === interaction.user.id ? ' _(You)_' : '';
+                return `**#${rank}** ${displayName}${youNote} — **${Number(row.points || 0).toLocaleString()}** pts`;
+            });
+
+            const embed = new EmbedBuilder()
+                .setColor('#ffd700')
+                .setTitle('🏆 Vouch Leaderboard')
+                .setDescription(lines.length ? lines.join('\n') : 'No players found on this page.')
+                .setTimestamp()
+                .setFooter({
+                    text: `Page ${page}/${totalPages} • Tracking ${totalEntries.toLocaleString()} players`
+                });
+
+            try {
+                const userPoints = await getUserBalance(interaction.user.id);
+                const userPointsValue = Number.isFinite(userPoints) ? Number(userPoints) : 0;
+                const rankRow = await new Promise((resolve, reject) => {
+                    db.get(
+                        'SELECT COUNT(*) + 1 AS rank FROM vouch_points WHERE points > ?',
+                        [userPointsValue],
+                        (err, row) => {
+                            if (err) reject(err);
+                            else resolve(row || { rank: totalEntries + 1 });
+                        }
+                    );
+                });
+                const rankValue = Number.isFinite(rankRow?.rank) ? Number(rankRow.rank) : (totalEntries + 1);
+                embed.addFields({
+                    name: 'Your Standing',
+                    value: `#${rankValue} with **${userPointsValue.toLocaleString()}** point${userPointsValue === 1 ? '' : 's'}`,
+                    inline: false
+                });
+            } catch (rankError) {
+                console.error('Leaderboard rank lookup error:', rankError);
+            }
+
+            await interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
+        } catch (error) {
+            console.error('Leaderboard command error:', error);
+            try {
+                await interaction.reply({ content: '❌ Unable to load the leaderboard right now.', ephemeral: true });
+            } catch {}
+        }
+        return;
+    }
+
     if (interaction.commandName === 'addpoints' || interaction.commandName === 'removepoints') {
         if (!interaction.inGuild()) {
             interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
