@@ -377,9 +377,19 @@ function setCooldown(key) {
 
 function ensureCasinoChannel(interaction) {
     const allowedId = process.env.CASINO_CHANNEL_ID;
-    const nameOk = interaction.channel?.name?.toLowerCase().includes('casino');
-    if (allowedId) return interaction.channelId === allowedId;
-    return Boolean(nameOk);
+    const channel = interaction.channel;
+    const lowerName = channel?.name?.toLowerCase() || '';
+    const parentLowerName = channel?.isThread?.() ? (channel.parent?.name?.toLowerCase() || '') : '';
+
+    if (allowedId) {
+        if (interaction.channelId === allowedId) return true;
+        if (channel?.isThread?.() && channel.parentId === allowedId) return true;
+        return false;
+    }
+
+    if (lowerName.includes('casino')) return true;
+    if (parentLowerName.includes('casino')) return true;
+    return false;
 }
 
 function getUserBalance(userId) {
@@ -1460,6 +1470,8 @@ client.once('ready', async () => {
         {
             name: 'blackjack',
             description: 'Play blackjack against the dealer',
+            default_member_permissions: null,
+            dm_permission: false,
             options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
         },
         {
