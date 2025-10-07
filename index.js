@@ -1435,7 +1435,8 @@ client.once('ready', async () => {
         {
             name: 'vouchpoints',
             description: 'Check your or someone else\'s vouch points',
-            dm_permission: true, // Explicitly allow in DMs
+            dm_permission: false,
+            default_member_permissions: null, // Available to all members
             options: [
                 {
                     name: 'user',
@@ -1449,6 +1450,7 @@ client.once('ready', async () => {
             name: 'leaderboard',
             description: 'View the top vouch point holders on the server',
             dm_permission: false,
+            default_member_permissions: null, // Available to all members
             options: [
                 {
                     name: 'limit',
@@ -1470,15 +1472,15 @@ client.once('ready', async () => {
         {
             name: 'blackjack',
             description: 'Play blackjack against the dealer',
-            // Explicitly set default permissions to "0" (everyone) to override any
-            // previously cached admin-only settings for this command.
-            default_member_permissions: '0',
+            default_member_permissions: null, // Available to all members
             dm_permission: false,
             options: [ { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true } ]
         },
         {
             name: 'roulette',
             description: 'Spin the roulette wheel',
+            default_member_permissions: null, // Available to all members
+            dm_permission: false,
             options: [
                 { name: 'type', description: 'Bet type (red, black, even, odd, low, high, number)', type: 3, required: true },
                 { name: 'amount', description: 'Bet amount (>=1)', type: 4, required: true },
@@ -1488,6 +1490,8 @@ client.once('ready', async () => {
         {
             name: 'slots',
             description: 'Pull the lever on slots',
+            default_member_permissions: null, // Available to all members
+            dm_permission: false,
             options: [
                 { name: 'amount', description: 'Total bet amount (>=1)', type: 4, required: true },
                 { name: 'lines', description: 'Number of paylines (1-20)', type: 4, required: false, min_value: 1, max_value: 20 },
@@ -1515,7 +1519,8 @@ client.once('ready', async () => {
         {
             name: 'sendpoints',
             description: 'Send vouch points to another user',
-            dm_permission: true,
+            dm_permission: false,
+            default_member_permissions: null, // Available to all members
             options: [
                 {
                     name: 'user',
@@ -1535,7 +1540,8 @@ client.once('ready', async () => {
         {
             name: 'transactions',
             description: 'View your recent point transactions',
-            dm_permission: true,
+            dm_permission: false,
+            default_member_permissions: null, // Available to all members
             options: [
                 {
                     name: 'user',
@@ -1556,7 +1562,8 @@ client.once('ready', async () => {
         {
             name: 'pay',
             description: 'Send vouch points to another player (alias of /sendpoints)',
-            dm_permission: true,
+            dm_permission: false,
+            default_member_permissions: null, // Available to all members
             options: [
                 { name: 'user', description: 'The user to send points to', type: 6, required: true },
                 { name: 'amount', description: 'Amount of points to send (minimum 1)', type: 4, required: true, min_value: 1 }
@@ -1592,7 +1599,12 @@ client.once('ready', async () => {
                 { name: 'duration_minutes', description: 'Duration in minutes (optional)', type: 4, required: false }
             ]
         },
-        { name: 'multiplierstatus', description: 'Show current vouch multiplier' },
+        { 
+            name: 'multiplierstatus', 
+            description: 'Show current vouch multiplier',
+            dm_permission: false,
+            default_member_permissions: null // Available to all members
+        },
         { name: 'resetmultiplier', description: 'Admin: Reset multiplier to 1x', default_member_permissions: PermissionFlagsBits.Administrator.toString(), dm_permission: false },
         {
             name: 'wipevouches',
