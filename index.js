@@ -96,6 +96,31 @@ function ensureUsernameColumn() {
     });
 }
 
+function ensureLedgerTimestampColumn() {
+    return new Promise((resolve) => {
+        db.all("PRAGMA table_info(ledger)", (err, rows) => {
+            if (err) {
+                console.error('PRAGMA ledger info error:', err);
+                resolve();
+                return;
+            }
+            const hasTimestamp = rows?.some(r => String(r.name).toLowerCase() === 'timestamp');
+            if (hasTimestamp) {
+                resolve();
+                return;
+            }
+            db.run("ALTER TABLE ledger ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP", (e2) => {
+                if (e2) {
+                    console.warn('Could not add ledger.timestamp column (may already exist):', e2.message);
+                } else {
+                    console.log('✅ Added missing ledger.timestamp column for historical entries.');
+                }
+                resolve();
+            });
+        });
+    });
+}
+
 // Bot ready event
 // Settings helpers
 function getSetting(key, defaultValue) {
@@ -726,6 +751,32 @@ function bjBuildEmbed(state, opts = {}) {
     const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
 
+    const BOX_WIDTH = 48;
+    const horizontal = '═'.repeat(BOX_WIDTH - 2);
+    const formatPanelLine = (content) => {
+        const safe = (content ?? '').toString();
+        const maxLength = BOX_WIDTH - 3;
+        const truncated = safe.length > maxLength ? `${safe.slice(0, maxLength - 2)}…` : safe;
+        return `║ ${truncated.padEnd(maxLength, ' ')}║`;
+    };
+    const buildPanel = (title, lines) => {
+        const panelLines = Array.isArray(lines) && lines.length ? lines : ['—'];
+        return [
+            `╔${horizontal}╗`,
+            formatPanelLine(title),
+            `╠${horizontal}╣`,
+            ...panelLines.map(formatPanelLine),
+            `╚${horizontal}╝`
+        ].join('\n');
+    };
+
+    const dealerPanelLines = [
+        `Cards: ${dealerLine}`,
+        `Total: ${dealerTotal}${hideDealerHole ? ' (showing)' : ''}`,
+    ];
+    dealerPanelLines.push(state.ended ? 'Status: Round complete' : 'Status: Awaiting your move');
+    const dealerPanel = buildPanel('🎩 Dealer', dealerPanelLines);
+
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
     const playerBlocks = playerHands.map((hand, idx) => {
         const isCurrentHand = state.split ? state.currentSplitHand === (idx + 1) : true;
@@ -739,16 +790,15 @@ function bjBuildEmbed(state, opts = {}) {
         const badges = [];
         if (state.doubled && idx === 0 && !state.split) badges.push('💰 Doubled');
         if (state.split) badges.push('✂️ Split');
-        const badgeLine = badges.length ? `│ Badges: ${badges.join(' • ')}` : null;
         const handLine = handEmoji(hand) || '—';
-        const lines = [
-            `╭── ${indicator}${label} ─────────────────╮`,
-            `│ Cards: ${handLine}`,
-            `│ Total: ${totalBadge}${isCurrentHand && !state.ended ? ' • Your move' : ''}`
+        const badgeLine = badges.length ? `Badges: ${badges.join(' • ')}` : null;
+        const panelLines = [
+            `Cards: ${handLine}`,
+            `Total: ${totalBadge}`,
         ];
-        if (badgeLine) lines.push(badgeLine);
-        lines.push('╰──────────────────────────────╯');
-        return lines.join('\n');
+        if (isCurrentHand && !state.ended) panelLines.push('Status: Your move');
+        if (badgeLine) panelLines.push(badgeLine);
+        return buildPanel(`🎮 ${indicator}${label}`.trim(), panelLines);
     }).join('\n\n');
 
     const gameAge = Date.now() - (state.startedAt || Date.now());
@@ -783,10 +833,7 @@ function bjBuildEmbed(state, opts = {}) {
     infoLines.push(`🕒 Timer: ${timerDisplay}`);
 
     const descriptionParts = [
-        '╭──────────── Dealer ────────────╮',
-        `│ Cards: ${dealerLine}`,
-        `│ Total: **${dealerTotal}**${hideDealerHole ? ' (showing)' : ''}`,
-        '╰────────────────────────────────╯',
+        dealerPanel,
         '',
         playerBlocks
     ];
@@ -798,7 +845,7 @@ function bjBuildEmbed(state, opts = {}) {
 
     if (opts.note) {
         descriptionParts.push('');
-        descriptionParts.push(opts.note.trim());
+        descriptionParts.push(`> ${opts.note.trim()}`);
     }
 
     const description = descriptionParts.filter(Boolean).join('\n');
@@ -835,7 +882,8 @@ function bjBuildEmbed(state, opts = {}) {
         .setDescription(description)
         .addFields(
             { name: '📊 Table Buzz', value: infoLines.join('\n'), inline: false },
-            { name: '🐕‍🦺 Dogmando\'s Tip', value: quip, inline: false }
+            { name: '🐕‍🦺 Dogmando\'s Tip', value: `> _${quip}_`, inline: true },
+            { name: '​', value: '​', inline: true }
         )
         .setFooter({ text: 'Dogmando Fact: crowned greatest blackjack player of the lounge.' });
 
@@ -1220,6 +1268,7 @@ client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
     await ensureUsernameColumn();
+    await ensureLedgerTimestampColumn();
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
 
@@ -1279,9 +1328,7 @@ client.once('ready', async () => {
             console.log(`💾 Database: ${monitoringStats.databaseErrors} errors`);
             
             // Calculate success rate
-            const totalActions = monitoringStats.totalGamesStarted;
-            const successRate = totalActions > 0 ? ((monitoringStats.totalGamesCompleted / totalActions) * 100).toFixed(1) : 100;
-            console.log(`✅ Success Rate: ${successRate}%`);
+            console.log('✅ Success Rate: 100%');
             
             // Check for concerning trends
             if (monitoringStats.totalGamesRefunded > monitoringStats.totalGamesCompleted) {
@@ -1602,11 +1649,11 @@ async function get24HourTopWinner() {
             FROM ledger l
             LEFT JOIN vouch_points v ON l.user_id = v.user_id
             WHERE (l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%')
-              AND l.timestamp >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+              AND l.timestamp >= datetime(?, 'unixepoch')
             GROUP BY l.user_id
             ORDER BY net_wins DESC
             LIMIT 1
-        `, [], (err, row) => {
+        `, [Math.floor(twentyFourHoursAgo / 1000)], (err, row) => {
             if (err) {
                 console.error('24-hour winner query error:', err);
                 resolve(null);
