@@ -77,7 +77,7 @@ db.serialize(() => {
     db.run("ALTER TABLE ledger ADD COLUMN metadata TEXT", () => {}); // Ignore error if exists
 });
 
-// Ensure username column exists on vouch_points (for persistent display names)
+// Ensure required columns exist on legacy databases
 function ensureUsernameColumn() {
     return new Promise((resolve) => {
         db.all('PRAGMA table_info(vouch_points)', (err, rows) => {
@@ -91,6 +91,36 @@ function ensureUsernameColumn() {
             db.run('ALTER TABLE vouch_points ADD COLUMN username TEXT', (e2) => {
                 if (e2) console.warn('Could not add username column (may already exist):', e2.message);
                 resolve();
+            });
+        });
+    });
+}
+
+function ensureLedgerColumns() {
+    return new Promise((resolve) => {
+        db.all('PRAGMA table_info(ledger)', (err, rows) => {
+            if (err) {
+                console.error('PRAGMA ledger info error:', err);
+                resolve();
+                return;
+            }
+
+            const hasTimestamp = rows?.some(r => String(r.name).toLowerCase() === 'timestamp');
+            if (hasTimestamp) {
+                resolve();
+                return;
+            }
+
+            db.run('ALTER TABLE ledger ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP', (alterErr) => {
+                if (alterErr) {
+                    console.warn('Could not add timestamp column to ledger (may already exist):', alterErr.message);
+                    resolve();
+                    return;
+                }
+
+                db.run('UPDATE ledger SET timestamp = COALESCE(timestamp, CURRENT_TIMESTAMP) WHERE timestamp IS NULL', () => {
+                    resolve();
+                });
             });
         });
     });
@@ -494,70 +524,110 @@ function calculateBlackjackTotalStake(state) {
     return perHand * hands;
 }
 
-// Refund most recent unsettled blackjack bet if present (used when state missing)
-async function refundLastUnsettledBlackjackBet(userId) {
+function formatChipAmount(value) {
+    const n = Math.round(Number(value) || 0);
+    return n.toLocaleString();
+}
+
+async function getBlackjackLedgerTrail(userId) {
     try {
         const lastBet = await new Promise((resolve, reject) => {
             db.get(
-                `SELECT timestamp, delta, metadata FROM ledger
+                `SELECT id, timestamp, delta, metadata FROM ledger
                  WHERE user_id = ? AND reason = 'blackjack_bet'
-                 ORDER BY timestamp DESC
+                 ORDER BY id DESC
                  LIMIT 1`,
                 [userId],
                 (err, row) => err ? reject(err) : resolve(row)
             );
         });
-        if (!lastBet) return false;
+        if (!lastBet) return null;
 
-        const afterCount = await new Promise((resolve, reject) => {
-            db.get(
-                `SELECT COUNT(*) AS c FROM ledger
-                 WHERE user_id = ? AND timestamp >= ? AND (
-                    reason LIKE 'blackjack_payout%' OR
-                    reason LIKE 'blackjack_split_payout%' OR
-                    reason LIKE 'blackjack_refund_%' OR
-                    reason = 'blackjack_settled' OR
-                    reason LIKE 'blackjack_timeout_forfeit%'
-                 )`,
-                [userId, lastBet.timestamp],
-                (err, row) => err ? reject(err) : resolve(row?.c || 0)
-            );
-        });
-        if (afterCount > 0) return false; // already settled/refunded
-
-        let amount = Math.abs(Number(lastBet.delta || 0));
+        let baseBet = Math.abs(Number(lastBet.delta || 0));
         try {
             const meta = JSON.parse(lastBet.metadata || '{}');
             if (meta && Number.isFinite(Number(meta.bet))) {
-                amount = Math.abs(Number(meta.bet));
+                baseBet = Math.abs(Number(meta.bet));
             }
         } catch {}
 
-        const extras = await new Promise((resolve, reject) => {
+        const subsequent = await new Promise((resolve, reject) => {
             db.all(
-                `SELECT reason, delta, metadata FROM ledger
-                 WHERE user_id = ? AND timestamp >= ? AND reason IN ('blackjack_double_bet','blackjack_split_bet')`,
-                [userId, lastBet.timestamp],
+                `SELECT id, reason, delta, metadata, timestamp FROM ledger
+                 WHERE user_id = ? AND id > ?
+                 ORDER BY id ASC`,
+                [userId, lastBet.id],
                 (err, rows) => err ? reject(err) : resolve(rows || [])
             );
         });
 
-        const extraDetails = [];
-        for (const row of extras) {
-            let extra = Math.abs(Number(row?.delta || 0));
-            try {
-                const meta = JSON.parse(row?.metadata || '{}');
-                if (meta && Number.isFinite(Number(meta.bet))) {
-                    extra = Math.abs(Number(meta.bet));
+        const events = [];
+        for (const row of subsequent) {
+            if (row.reason === 'blackjack_bet') break; // Next round starts here
+            events.push(row);
+        }
+
+        const extras = [];
+        let extrasTotal = 0;
+        for (const row of events) {
+            if (row.reason === 'blackjack_double_bet' || row.reason === 'blackjack_split_bet') {
+                let amount = Math.abs(Number(row.delta || 0));
+                try {
+                    const meta = JSON.parse(row.metadata || '{}');
+                    if (meta && Number.isFinite(Number(meta.bet))) {
+                        amount = Math.abs(Number(meta.bet));
+                    }
+                } catch {}
+                if (amount > 0) {
+                    extras.push({ reason: row.reason, amount });
+                    extrasTotal += amount;
                 }
-            } catch {}
-            if (extra > 0) {
-                amount += extra;
-                extraDetails.push({ reason: row.reason, amount: extra });
             }
         }
 
-        if (!amount || amount <= 0) return false;
+        const settlementEvents = events.filter((row) => {
+            const reason = row.reason || '';
+            return reason === 'blackjack_settled' ||
+                reason.startsWith('blackjack_payout') ||
+                reason.startsWith('blackjack_split_payout') ||
+                reason.startsWith('blackjack_refund_') ||
+                reason.startsWith('blackjack_timeout_forfeit');
+        });
+
+        return {
+            baseBet,
+            extras,
+            extrasTotal,
+            totalStake: baseBet + extrasTotal,
+            lastBetTimestamp: lastBet.timestamp,
+            settlementEvents,
+            events
+        };
+    } catch (e) {
+        console.error('getBlackjackLedgerTrail error:', e);
+        return null;
+    }
+}
+
+function prepareBlackjackRefund(trail) {
+    if (!trail) return null;
+    if (!trail.totalStake || trail.totalStake <= 0) return null;
+    if (trail.settlementEvents && trail.settlementEvents.length > 0) return null;
+
+    const metadata = { amount: trail.totalStake };
+    if (trail.extras && trail.extras.length > 0) {
+        metadata.extras = trail.extras;
+    }
+
+    return { amount: trail.totalStake, metadata };
+}
+
+// Refund most recent unsettled blackjack bet if present (used when state missing)
+async function refundLastUnsettledBlackjackBet(userId) {
+    try {
+        const trail = await getBlackjackLedgerTrail(userId);
+        const refund = prepareBlackjackRefund(trail);
+        if (!refund) return false;
 
         // MONITORING: Track refund
         if (global.gameMonitoring) {
@@ -565,14 +635,82 @@ async function refundLastUnsettledBlackjackBet(userId) {
             console.log(`📊 Game refunded for user ${userId} (Total: ${global.gameMonitoring.totalGamesRefunded})`);
         }
 
-        const metadata = { amount };
-        if (extraDetails.length > 0) metadata.extras = extraDetails;
-        await changeUserBalance(userId, 'unknown', amount, 'blackjack_refund_no_active', metadata);
+        await changeUserBalance(userId, 'unknown', refund.amount, 'blackjack_refund_no_active', refund.metadata);
         return true;
     } catch (e) {
         console.error('refundLastUnsettledBlackjackBet error:', e);
         return false;
     }
+}
+
+async function describeMissingBlackjackRound(userId) {
+    const trail = await getBlackjackLedgerTrail(userId);
+    if (!trail) {
+        return {
+            message: '🧽 The blackjack table reset itself before that hand could finish. Fresh cards are ready with `/blackjack` whenever you are—Dogmando already called dibs on the lucky seat.'
+        };
+    }
+
+    const refund = prepareBlackjackRefund(trail);
+    if (refund) {
+        await changeUserBalance(userId, 'unknown', refund.amount, 'blackjack_refund_no_active', {
+            ...refund.metadata,
+            auto: true
+        });
+        return {
+            message: `🧹 That hand vanished into the void, so we scooped **${formatChipAmount(refund.amount)}** chips back into your stack. Dogmando gave an approving nod.`
+        };
+    }
+
+    const settlementEvents = trail.settlementEvents || [];
+    if (settlementEvents.length === 0) {
+        return {
+            message: '🕵️ We could not recover the table state, but no chips were at risk. Dogmando still insists it counts as a win for the house cat.'
+        };
+    }
+
+    const refundEvent = settlementEvents.find(e => (e.reason || '').startsWith('blackjack_refund_'));
+    if (refundEvent) {
+        let refundAmount = Math.abs(Number(refundEvent.delta || 0));
+        try {
+            const meta = JSON.parse(refundEvent.metadata || '{}');
+            if (meta && Number.isFinite(Number(meta.amount))) {
+                refundAmount = Math.abs(Number(meta.amount));
+            }
+        } catch {}
+        return {
+            message: `♻️ That round was already refunded for **${formatChipAmount(refundAmount)}** chips earlier. Dogmando says you owe him a dramatic retelling.`
+        };
+    }
+
+    const timeoutEvent = settlementEvents.find(e => (e.reason || '').startsWith('blackjack_timeout_forfeit'));
+    if (timeoutEvent) {
+        return {
+            message: `⏰ That table timed out and the house kept **${formatChipAmount(trail.totalStake)}** chips. Dogmando muttered, "Bathroom breaks are for people without 21s."`
+        };
+    }
+
+    const payoutEvents = settlementEvents.filter(e => {
+        const reason = e.reason || '';
+        return reason.startsWith('blackjack_payout') || reason.startsWith('blackjack_split_payout');
+    });
+    if (payoutEvents.length > 0) {
+        const total = payoutEvents.reduce((acc, row) => acc + Math.max(0, Number(row.delta || 0)), 0);
+        return {
+            message: `🎉 That round already paid out **${formatChipAmount(total)}** chips. Dogmando approves and demands a celebratory howl.`
+        };
+    }
+
+    const settled = settlementEvents.find(e => (e.reason || '') === 'blackjack_settled');
+    if (settled) {
+        return {
+            message: '📗 The dealer had already wrapped that hand up. Check your ledger—Dogmando already logged it in his secret playbook.'
+        };
+    }
+
+    return {
+        message: '🧙‍♂️ A mysterious void ate that blackjack round, but your chips are squared away. Dogmando blames sorcery.'
+    };
 }
 
 // =============== NEW BLACKJACK (Player-friendly) ===============
@@ -618,81 +756,145 @@ function bjBuildEmbed(state, opts = {}) {
     const dealerLine = `${handEmoji(dealerShown)}${dealerHiddenCount > 0 ? (' ' + hidden(dealerHiddenCount)) : ''}`;
     const dealerTotal = hideDealerHole ? `${handValue(dealerShown)}?` : `${handValue(state.dealer)}`;
 
-    // Get 24-hour winner info with better fallback
-    let winnerInfo = '💎 VIP CASINO EXPERIENCE';
-    if (opts.topWinner && opts.topWinner.username) {
-        const netWins = opts.topWinner.net_wins || 0;
-        winnerInfo = `🏆 ${opts.topWinner.username} (+${netWins.toLocaleString()})`;
-    } else if (opts.topWinner === null) {
-        winnerInfo = '💎 NO WINNERS YET TODAY';
-    }
-
-    // Precompute header text (inject jackpot if provided)
-    const headerText = (opts && Object.prototype.hasOwnProperty.call(opts, 'jackpot'))
-        ? `${winnerInfo} • 💰 Jackpot: ${opts.jackpot}`
-        : `${winnerInfo}`;
-
-    // Handle split hands with glassmorphism pill badges
     const playerHands = state.split ? [state.player, state.splitHand] : [state.player];
-    const playerLines = playerHands.map((hand, idx) => {
-        const isCurrentHand = state.split && state.currentSplitHand === (idx + 1);
-        const handLabel = state.split ? (idx === 0 ? 'Hand 1' : 'Hand 2') : 'Player';
-        const handCards = handEmoji(hand);
-        const handTotal = handValue(hand);
-        const activeIndicator = isCurrentHand ? '✨ ' : '  ';
+    const panelWidth = 46;
+    const horizontalRule = '━'.repeat(panelWidth - 2);
+    const charLength = (value) => [...(value || '')].length;
+    const frameLine = (content = '') => {
+        const maxContent = panelWidth - 4;
+        let display = content ?? '';
+        if (charLength(display) > maxContent) {
+            display = [...display].slice(0, maxContent - 1).join('') + '…';
+        }
+        const padding = Math.max(0, maxContent - charLength(display));
+        return `┃ ${display}${' '.repeat(padding)} ┃`;
+    };
 
-        // Pill badge styling for totals (glassmorphism effect)
-        const totalBadge = handTotal > 21 ? '💥 BUST' :
-                          handTotal === 21 ? '🎉 BLACKJACK' :
-                          `🎯 ${handTotal}`;
-
-        // Enhanced card container with glassmorphism borders
-        const cardContainer = `\n║ ${activeIndicator}${handLabel}: ${handCards}║`;
-        const totalContainer = `\n║     ${totalBadge.padEnd(25,' ')}║`;
-
-        return cardContainer + totalContainer;
-    }).join('\n╟────────────────────────────────────────────────────────────────────────────╢');
-
-    // Add countdown timer if game is active
-    const gameAge = Date.now() - state.startedAt;
-    const timeLeft = Math.max(0, Math.floor((30000 - gameAge) / 1000)); // 30 second timeout
-    const timerDisplay = state.ended ? '⏰ GAME ENDED' : timeLeft > 0 ? `⏰ ${timeLeft}s left` : '⏰ TIMING OUT...';
-
-    // Glassmorphism table design with enhanced borders
-    const table = [
-        '╔════════════════════════════════════════════════════════════════════════════════╗',
-        '║                        🎰 PREMIUM BLACKJACK CASINO 🎰                         ║',
-        `║ ${headerText.padEnd(78,' ')} ║`,
-        '╠════════════════════════════════════════════════════════════════════════════════╣',
-        '║                                                                                ║',
-        `║ 🎯 DEALER: ${dealerLine.padEnd(65,' ')}║`,
-        `║ 🎯 TOTAL : ${dealerTotal.padEnd(20,' ')}║`,
-        '║                                                                                ║',
-        '╟────────────────────────────────────────────────────────────────────────────╢',
-        '║                                                                                ║',
-        playerLines,
-        '║                                                                                ║',
-        `║ ${timerDisplay.padEnd(78,' ')}║`,
-        '╚════════════════════════════════════════════════════════════════════════════════╝'
+    const dealerBlock = [
+        `┏${horizontalRule}┓`,
+        frameLine('🎩 DEALER LOUNGE'),
+        frameLine(''),
+        frameLine(`Cards: ${dealerLine}`.trim()),
+        frameLine(`Total: ${dealerTotal}${hideDealerHole ? ' (showing)' : ''}`),
+        `┗${horizontalRule}┛`
     ].join('\n');
 
-    const note = opts.note ? `\n\n${opts.note}` : '';
-    const gameStatus = state.split ? `\n🎮 Playing ${state.currentSplitHand === 1 ? 'Hand 1' : 'Hand 2'} of 2` : '';
+    const playerBlocks = playerHands.map((hand, idx) => {
+        const isCurrentHand = state.split ? state.currentSplitHand === (idx + 1) : true;
+        const label = state.split ? `Hand ${idx + 1}` : 'Your Hand';
+        const total = handValue(hand);
+        let totalBadge = `🎯 ${total}`;
+        if (total > 21) totalBadge = '💥 Bust';
+        else if (total === 21 && hand.length === 2) totalBadge = '🃏 Blackjack';
+        else if (total === 21) totalBadge = '🎉 Twenty-One';
+        const indicator = (isCurrentHand && !state.ended) ? '👉 ' : '';
+        const badges = [];
+        if (state.doubled && idx === 0 && !state.split) badges.push('💰 Doubled');
+        if (state.split) badges.push('✂️ Split');
+        const handLine = handEmoji(hand) || '—';
+        const lines = [
+            `┏${horizontalRule}┓`,
+            frameLine(`${indicator}${label.toUpperCase()}`.trim()),
+            frameLine(''),
+            frameLine(`Cards: ${handLine}`.trim()),
+            frameLine(`Total: ${totalBadge}${isCurrentHand && !state.ended ? ' • Your move' : ''}`.trim())
+        ];
+        if (badges.length) {
+            lines.push(frameLine(`Badges: ${badges.join(' • ')}`));
+        }
+        lines.push(`┗${horizontalRule}┛`);
+        return lines.join('\n');
+    }).join('\n\n');
 
-    // Dynamic colors for glassmorphism effect
-    let embedColor = '#0f0f23'; // Dark casino glass base
-    if (state.split) embedColor = '#1a0d2e'; // Purple glow for splits
-    if (opts.result) {
-        if (opts.result.includes('WIN') || opts.result.includes('BLACKJACK')) embedColor = '#0d4f3c'; // Green success
-        if (opts.result.includes('LOSE') || opts.result.includes('BUST')) embedColor = '#4f0d0d'; // Red failure
-        if (opts.result.includes('PUSH')) embedColor = '#4a4a0d'; // Yellow push
+    const gameAge = Date.now() - (state.startedAt || Date.now());
+    const timeLeft = Math.max(0, Math.floor((30000 - gameAge) / 1000));
+    let timerDisplay = '⏳ Waiting for action';
+    if (state.ended) {
+        timerDisplay = opts.result ? opts.result : '✅ Round complete';
+    } else if (timeLeft > 0) {
+        timerDisplay = `⏳ ${timeLeft}s to act`;
+    } else {
+        timerDisplay = '⏳ Dealer is getting restless';
     }
 
-    return new EmbedBuilder()
+    const perHandBet = getBlackjackPerHandBet(state);
+    const totalStake = calculateBlackjackTotalStake(state);
+
+    let winnerInfo = '💎 VIP lounge still wide open';
+    if (opts.topWinner && opts.topWinner.username) {
+        const netWins = Number(opts.topWinner.net_wins) || 0;
+        winnerInfo = `🏆 ${opts.topWinner.username} (+${formatChipAmount(netWins)})`;
+    } else if (opts.topWinner === null) {
+        winnerInfo = '🏆 No winners logged today';
+    }
+
+    const infoLines = [];
+    if (perHandBet) infoLines.push(`• Bet: **${formatChipAmount(perHandBet)}**${state.split ? ' per hand' : ''}`);
+    if (state.split && totalStake) infoLines.push(`• Total at risk: **${formatChipAmount(totalStake)}**`);
+    infoLines.push(`• 24h Legend: ${winnerInfo}`);
+    if (Object.prototype.hasOwnProperty.call(opts, 'jackpot')) {
+        infoLines.push(`• Slots Jackpot: **${formatChipAmount(opts.jackpot)}**`);
+    }
+    infoLines.push(`• Timer: ${timerDisplay}`);
+
+    const tablePanelSections = [dealerBlock];
+    if (playerBlocks) {
+        tablePanelSections.push(playerBlocks);
+    }
+    const tablePanel = ['```', tablePanelSections.join('\n\n'), '```'].join('\n');
+
+    const descriptionParts = [tablePanel];
+
+    if (state.split && !state.ended) {
+        descriptionParts.push('');
+        descriptionParts.push(`🎮 Currently playing **Hand ${state.currentSplitHand}** of 2`);
+    }
+
+    if (opts.note) {
+        descriptionParts.push('');
+        descriptionParts.push(opts.note.trim());
+    }
+
+    const description = descriptionParts.filter(Boolean).join('\n');
+
+    const activeQuips = [
+        'Dogmando whispers, "Split eights. Trust me, I\'m the lounge legend."',
+        'Dogmando flexes: "I hit 21 before the dealer finished shuffling."',
+        'Dogmando taps the felt: "Double downs are hugs with extra chips."'
+    ];
+    const finishedQuips = [
+        'Dogmando logs another win in his hall-of-fame chew toy.',
+        'Dogmando howls, "Even my naps count as victories."',
+        'Dogmando polishes the trophy: "Another challenger, another story."'
+    ];
+    const quipPool = state.ended ? finishedQuips : activeQuips;
+    const seedSource = `${state.userId || ''}${state.startedAt || 0}`;
+    let seed = 0;
+    for (const ch of seedSource) seed = (seed + ch.charCodeAt(0)) % 2147483647;
+    const quip = quipPool.length ? quipPool[seed % quipPool.length] : 'Dogmando watches silently, plotting his next blackjack masterpiece.';
+
+    let embedColor = 0x5e3bff;
+    if (state.split) embedColor = 0x7f27ff;
+    if (!state.ended) embedColor = 0x3c2a4d;
+    if (opts.result) {
+        const normalized = String(opts.result).toUpperCase();
+        if (normalized.includes('WIN') || normalized.includes('BLACKJACK')) embedColor = 0x1abc9c;
+        else if (normalized.includes('PUSH')) embedColor = 0xf1c40f;
+        else if (normalized.includes('LOSE') || normalized.includes('BUST')) embedColor = 0xe74c3c;
+    }
+
+    const embed = new EmbedBuilder()
         .setColor(embedColor)
-        .setTitle('🎰 PREMIUM BLACKJACK CASINO')
-        .setDescription(`${table}${note}${gameStatus}`)
-        .setFooter({ text: `💰 Bet: ${state.bet}${state.split ? ' per hand' : ''} • 🎲 24h Top Winner • ⚡ Lightning Fast` });
+        .setTitle('🃏 Neon Blackjack Lounge')
+        .setDescription(description)
+        .addFields(
+            { name: '📊 Table Buzz', value: infoLines.join('\n'), inline: true },
+            { name: '🐕‍🦺 Dogmando\'s Tip', value: `_${quip}_`, inline: true },
+            { name: '​', value: '​', inline: true }
+        )
+        .setFooter({ text: 'Dogmando Fact: crowned greatest blackjack player of the lounge.' });
+
+    return embed;
 }
 
 function bjComponents(state) {
@@ -1072,6 +1274,7 @@ process.on('uncaughtException', (error) => {
 client.once('ready', async () => {
     console.log(`✅ Bot is online! Logged in as ${client.user.tag}`);
     client.user.setActivity('for pictures in #vouch', { type: 'WATCHING' });
+    await ensureLedgerColumns();
     await ensureUsernameColumn();
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
@@ -1441,9 +1644,9 @@ async function get24HourTopWinner() {
         return winnerCache.data;
     }
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         // Get current time minus 24 hours
-        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+        const twentyFourHoursAgo = Math.floor((Date.now() - (24 * 60 * 60 * 1000)) / 1000);
 
         // Query for net wins from casino games in last 24 hours
         // Join with vouch_points table to get username
@@ -1455,11 +1658,11 @@ async function get24HourTopWinner() {
             FROM ledger l
             LEFT JOIN vouch_points v ON l.user_id = v.user_id
             WHERE (l.reason LIKE 'blackjack_%' OR l.reason LIKE 'roulette_%' OR l.reason LIKE 'slots_%')
-              AND l.timestamp >= datetime(${twentyFourHoursAgo / 1000}, 'unixepoch')
+              AND COALESCE(strftime('%s', l.timestamp), 0) >= ?
             GROUP BY l.user_id
             ORDER BY net_wins DESC
             LIMIT 1
-        `, [], (err, row) => {
+        `, [twentyFourHoursAgo], (err, row) => {
             if (err) {
                 console.error('24-hour winner query error:', err);
                 resolve(null);
@@ -1548,11 +1751,8 @@ client.on('interactionCreate', async (interaction) => {
                 console.log('No active game found for user:', ownerId, '- attempting refund and disabling stale controls');
                 // Disable buttons on the stale message to prevent further clicks
                 await disableStaleInteractionComponents(interaction);
-                // Attempt to refund the last unsettled blackjack bet if any
-                const refunded = await refundLastUnsettledBlackjackBet(ownerId);
-                const msg = refunded
-                    ? 'No active game found. Your last blackjack bet has been refunded. Use `/blackjack` to start a new game.'
-                    : 'No active game found. Use `/blackjack` to start a new game.';
+                const summary = await describeMissingBlackjackRound(ownerId);
+                const msg = summary?.message || '🃏 The table reset itself before we could respond. Dogmando says to slam `/blackjack` and show the dealer who runs this lounge.';
                 try { await interaction.followUp({ content: msg, ephemeral: true }); } catch {}
                 blackjackLocks.delete(ownerId);
                 return;
