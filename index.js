@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder, PermissionFlagsBits, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder, PermissionFlagsBits, REST, Routes, ChannelType } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
@@ -433,6 +433,136 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
             console.error('Error ending multiplier:', e);
         }
     }, delay);
+}
+
+// ===== AUTO RESET FUNCTION =====
+async function performAutoReset(whitelistIds = [], targetGuildId = null) {
+    console.log('🔄 ========== STARTING AUTO SERVER RESET ==========');
+
+    if (!client?.user) {
+        console.warn('⚠️  Client not ready - aborting auto reset.');
+        return;
+    }
+
+    const workingWhitelist = Array.isArray(whitelistIds) ? [...whitelistIds] : [];
+    workingWhitelist.push(client.user.id);
+    const uniqueWhitelist = [...new Set(workingWhitelist.filter(id => typeof id === 'string' && id.length > 0))];
+
+    console.log(`🛡️  Protected users: ${uniqueWhitelist.join(', ') || 'None'}`);
+
+    const guilds = targetGuildId
+        ? [client.guilds.cache.get(targetGuildId)].filter(Boolean)
+        : Array.from(client.guilds.cache.values());
+
+    if (guilds.length === 0) {
+        console.log('❌ No guilds found to reset');
+        return;
+    }
+
+    for (const guild of guilds) {
+        console.log(`\n🔄 Processing guild: ${guild.name} (${guild.id})`);
+
+        const results = {
+            guildName: guild.name,
+            channelsDeleted: 0,
+            channelsCreated: 0,
+            membersKicked: 0,
+            membersSkipped: 0,
+            errors: []
+        };
+
+        try {
+            // ===== STEP 1: Delete #vouch channels =====
+            console.log('📁 Step 1/3: Deleting #vouch channels...');
+
+            const vouchChannels = guild.channels.cache.filter(ch =>
+                ch.name && ch.name.toLowerCase().includes('vouch')
+            );
+
+            for (const channel of vouchChannels.values()) {
+                try {
+                    await channel.delete('Auto reset on startup - preparing for #vees');
+                    results.channelsDeleted++;
+                    console.log(`  ✅ Deleted: #${channel.name}`);
+                } catch (error) {
+                    results.errors.push(`Failed to delete #${channel.name}: ${error.message}`);
+                    console.error(`  ❌ Failed to delete #${channel.name}:`, error.message);
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+
+            // ===== STEP 2: Create #vees channel =====
+            console.log('📁 Step 2/3: Creating #vees channel...');
+
+            try {
+                const veesChannel = await guild.channels.create({
+                    name: 'vees',
+                    type: ChannelType.GuildText,
+                    topic: '📸 Post pictures here and tag a Provider to earn vouch points!',
+                    reason: 'Auto reset on startup - new vouch system'
+                });
+                results.channelsCreated++;
+                console.log(`  ✅ Created: #${veesChannel.name}`);
+
+                await veesChannel.send({
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor('#00ff00')
+                            .setTitle('🎉 Welcome to #vees!')
+                            .setDescription('**Server Reset Complete!**\n\nThis is your new vouch channel.\n\n**How to earn points:**\n• Post a picture\n• Tag a Provider\n• Get rewarded automatically!\n\n*Bot restarted and reset successfully.*')
+                            .setTimestamp()
+                            .setFooter({ text: 'Auto reset completed on startup' })
+                    ]
+                });
+            } catch (error) {
+                results.errors.push(`Failed to create #vees: ${error.message}`);
+                console.error('  ❌ Failed to create #vees:', error.message);
+            }
+
+            // ===== STEP 3: Kick non-whitelisted members =====
+            console.log('👥 Step 3/3: Removing non-whitelisted members...');
+
+            await guild.members.fetch();
+
+            const membersToKick = guild.members.cache.filter(member =>
+                !uniqueWhitelist.includes(member.id) &&
+                !member.user.bot &&
+                member.kickable
+            );
+
+            console.log(`  📊 Found ${membersToKick.size} members to kick`);
+
+            for (const member of membersToKick.values()) {
+                try {
+                    await member.kick('Server reset on startup - non-whitelisted member');
+                    results.membersKicked++;
+                    console.log(`  ✅ Kicked: ${member.user.tag}`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (error) {
+                    results.membersSkipped++;
+                    results.errors.push(`Failed to kick ${member.user.tag}: ${error.message}`);
+                    console.error(`  ❌ Failed to kick ${member.user.tag}:`, error.message);
+                }
+            }
+
+            console.log(`\n✅ ========== RESET COMPLETE FOR ${guild.name} ==========`);
+            console.log(`📁 Channels deleted: ${results.channelsDeleted}`);
+            console.log(`📁 Channels created: ${results.channelsCreated}`);
+            console.log(`👥 Members kicked: ${results.membersKicked}`);
+            console.log(`👥 Members skipped: ${results.membersSkipped}`);
+            console.log(`⚠️  Errors: ${results.errors.length}`);
+
+            if (results.errors.length > 0) {
+                console.log('\n⚠️  Error details:');
+                results.errors.forEach(err => console.log(`  - ${err}`));
+            }
+        } catch (error) {
+            console.error(`❌ Fatal error processing guild ${guild.name}:`, error);
+        }
+    }
+
+    console.log('\n🎉 ========== AUTO RESET COMPLETED ==========\n');
+    console.log('⚠️  IMPORTANT: Auto-reset has run. Remove AUTO_RESET_ON_STARTUP from .env to prevent future resets!');
 }
 
 // Casino helpers (DB-backed; no in-memory bjGames)
@@ -1465,6 +1595,29 @@ client.once('ready', async () => {
     await setMultiplier(await getMultiplier());
     await scheduleMultiplierExpiryIfNeeded(client);
 
+    // ===== AUTO SERVER RESET CONFIGURATION =====
+    const AUTO_RESET_ENABLED = process.env.AUTO_RESET_ON_STARTUP === 'true';
+    const WHITELIST_IDS = (process.env.RESET_WHITELIST || '')
+        .split(',')
+        .map(id => id.trim())
+        .filter(id => id.length > 0);
+    const TARGET_GUILD_ID = process.env.GUILD_ID || null;
+
+    if (AUTO_RESET_ENABLED) {
+        console.log('🔄 AUTO SERVER RESET ENABLED - Starting in 10 seconds...');
+        console.log(`🛡️  Whitelisted users: ${WHITELIST_IDS.length}`);
+
+        setTimeout(async () => {
+            try {
+                await performAutoReset(WHITELIST_IDS, TARGET_GUILD_ID);
+            } catch (error) {
+                console.error('❌ Auto reset failed:', error);
+            }
+        }, 10000);
+    } else {
+        console.log('ℹ️  Auto server reset is DISABLED. Set AUTO_RESET_ON_STARTUP=true in .env to enable.');
+    }
+
     // Set up game state cleanup (every 10 minutes - less aggressive)
     // Legacy in-memory cleanup removed; DB-backed cleanup is handled elsewhere
     // setInterval(() => { /* removed bjGames cleanup */ }, 10 * 60 * 1000);
@@ -1736,6 +1889,20 @@ client.once('ready', async () => {
             default_member_permissions: PermissionFlagsBits.Administrator.toString(),
             dm_permission: false,
             options: [ { name: 'confirm', description: 'Type "yes" to confirm', type: 3, required: true } ]
+        },
+        {
+            name: 'triggerreset',
+            description: 'Admin: Manually trigger server reset (same as startup reset)',
+            default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+            dm_permission: false,
+            options: [
+                {
+                    name: 'confirm',
+                    description: 'Type "EXECUTE" to confirm',
+                    type: 3,
+                    required: true
+                }
+            ]
         }
     ];
 
@@ -3042,6 +3209,42 @@ client.on('interactionCreate', async (interaction) => {
             }
             interaction.reply({ content: '🧹 All vouch points have been wiped.' });
         });
+        return;
+    }
+
+    if (interaction.commandName === 'triggerreset') {
+        if (!interaction.inGuild()) {
+            await interaction.reply({ content: '❌ Server command only.', ephemeral: true });
+            return;
+        }
+
+        const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+        if (!isAdmin) {
+            await interaction.reply({ content: '❌ Admin only.', ephemeral: true });
+            return;
+        }
+
+        const confirm = interaction.options.getString('confirm');
+        if (confirm !== 'EXECUTE') {
+            await interaction.reply({ content: '❌ Type "EXECUTE" to confirm.', ephemeral: true });
+            return;
+        }
+
+        await interaction.reply({ content: '🔄 Starting manual server reset...', ephemeral: true });
+
+        const whitelistIds = (process.env.RESET_WHITELIST || '')
+            .split(',')
+            .map(id => id.trim())
+            .filter(id => id.length > 0);
+
+        try {
+            await performAutoReset(whitelistIds, interaction.guildId);
+            await interaction.followUp({ content: '✅ Reset complete! Check console for details.', ephemeral: true });
+        } catch (error) {
+            console.error('Manual reset error:', error);
+            await interaction.followUp({ content: '❌ Reset failed. Check console.', ephemeral: true });
+        }
+        return;
     }
 
     // Handle /sendpoints and /pay command (alias)
