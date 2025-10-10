@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder, PermissionFlagsBits, REST, Routes, ChannelType } = require('discord.js');
-const sqlite3 = require('sqlite3').verbose();
+const sqlite3 = require('@vscode/sqlite3');
+sqlite3.verbose();
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
