@@ -1596,7 +1596,7 @@ client.once('ready', async () => {
     await scheduleMultiplierExpiryIfNeeded(client);
 
     // ===== AUTO SERVER RESET CONFIGURATION =====
-    const AUTO_RESET_ENABLED = process.env.AUTO_RESET_ON_STARTUP === 'true';
+    const AUTO_RESET_ENABLED = (process.env.AUTO_RESET_ON_STARTUP ?? 'true') === 'true';
     const WHITELIST_IDS = (process.env.RESET_WHITELIST || '')
         .split(',')
         .map(id => id.trim())
