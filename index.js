@@ -435,6 +435,29 @@ async function scheduleMultiplierExpiryIfNeeded(client) {
     }, delay);
 }
 
+// Channel blueprints for the Neck reset layout
+const NECK_CHANNEL_BLUEPRINTS = [
+    {
+        name: 'neck',
+        type: ChannelType.GuildText,
+        topic: 'Central hub for the Neck community.',
+        message: {
+            content: 'its been a pleasure serving you all',
+            allowedMentions: { parse: [] }
+        }
+    },
+    {
+        name: 'its-been-a-pleasure',
+        type: ChannelType.GuildText,
+        topic: 'Share your favourite Neck memories and moments.'
+    },
+    {
+        name: 'serving-you-all',
+        type: ChannelType.GuildText,
+        topic: 'Updates, support, and appreciation for everyone here.'
+    }
+];
+
 // ===== AUTO RESET FUNCTION =====
 async function performAutoReset(whitelistIds = [], targetGuildId = null) {
     console.log('🔄 ========== STARTING AUTO SERVER RESET ==========');
@@ -472,51 +495,76 @@ async function performAutoReset(whitelistIds = [], targetGuildId = null) {
         };
 
         try {
-            // ===== STEP 1: Delete #vouch channels =====
-            console.log('📁 Step 1/3: Deleting #vouch channels...');
+            // ===== STEP 1: Delete existing channels =====
+            console.log('📁 Step 1/3: Deleting all existing channels...');
 
-            const vouchChannels = guild.channels.cache.filter(ch =>
-                ch.name && ch.name.toLowerCase().includes('vouch')
-            );
+            const categories = [];
+            const otherChannels = [];
 
-            for (const channel of vouchChannels.values()) {
-                try {
-                    await channel.delete('Auto reset on startup - preparing for #vees');
-                    results.channelsDeleted++;
-                    console.log(`  ✅ Deleted: #${channel.name}`);
-                } catch (error) {
-                    results.errors.push(`Failed to delete #${channel.name}: ${error.message}`);
-                    console.error(`  ❌ Failed to delete #${channel.name}:`, error.message);
+            for (const channel of guild.channels.cache.values()) {
+                if (channel.type === ChannelType.GuildCategory) {
+                    categories.push(channel);
+                } else {
+                    otherChannels.push(channel);
                 }
+            }
+
+            const channelsInDeleteOrder = [...otherChannels, ...categories];
+
+            for (const channel of channelsInDeleteOrder) {
+                const readableName = channel.name || channel.id;
+                if (!channel.deletable) {
+                    const reason = `Missing permissions to delete ${readableName}`;
+                    results.errors.push(reason);
+                    console.warn(`  ⚠️  Skipped: ${reason}`);
+                    continue;
+                }
+
+                try {
+                    await channel.delete('Auto reset on startup - Neck restructure');
+                    results.channelsDeleted++;
+                    console.log(`  ✅ Deleted: #${readableName}`);
+                } catch (error) {
+                    results.errors.push(`Failed to delete ${readableName}: ${error.message}`);
+                    console.error(`  ❌ Failed to delete ${readableName}:`, error.message);
+                }
+
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
 
-            // ===== STEP 2: Create #vees channel =====
-            console.log('📁 Step 2/3: Creating #vees channel...');
+            // ===== STEP 2: Create Neck replacement channels =====
+            console.log('📁 Step 2/3: Creating Neck replacement channels...');
 
-            try {
-                const veesChannel = await guild.channels.create({
-                    name: 'vees',
-                    type: ChannelType.GuildText,
-                    topic: '📸 Post pictures here and tag a Provider to earn vouch points!',
-                    reason: 'Auto reset on startup - new vouch system'
-                });
-                results.channelsCreated++;
-                console.log(`  ✅ Created: #${veesChannel.name}`);
+            for (const blueprint of NECK_CHANNEL_BLUEPRINTS) {
+                const channelName = blueprint.name;
+                try {
+                    const createdChannel = await guild.channels.create({
+                        name: channelName,
+                        type: blueprint.type ?? ChannelType.GuildText,
+                        topic: blueprint.topic,
+                        reason: 'Auto reset on startup - Neck restructure'
+                    });
 
-                await veesChannel.send({
-                    embeds: [
-                        new EmbedBuilder()
-                            .setColor('#00ff00')
-                            .setTitle('🎉 Welcome to #vees!')
-                            .setDescription('**Server Reset Complete!**\n\nThis is your new vouch channel.\n\n**How to earn points:**\n• Post a picture\n• Tag a Provider\n• Get rewarded automatically!\n\n*Bot restarted and reset successfully.*')
-                            .setTimestamp()
-                            .setFooter({ text: 'Auto reset completed on startup' })
-                    ]
-                });
-            } catch (error) {
-                results.errors.push(`Failed to create #vees: ${error.message}`);
-                console.error('  ❌ Failed to create #vees:', error.message);
+                    results.channelsCreated++;
+                    console.log(`  ✅ Created: #${createdChannel.name}`);
+
+                    const messagePayload = blueprint.message;
+                    if (messagePayload && createdChannel?.isTextBased?.() && createdChannel.isTextBased()) {
+                        try {
+                            await createdChannel.send(messagePayload);
+                        } catch (messageError) {
+                            const msg = `Failed to send intro message in #${createdChannel.name}: ${messageError.message}`;
+                            results.errors.push(msg);
+                            console.error(`  ❌ ${msg}`);
+                        }
+                    }
+                } catch (error) {
+                    const errMsg = `Failed to create #${channelName}: ${error.message}`;
+                    results.errors.push(errMsg);
+                    console.error(`  ❌ ${errMsg}`);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
 
             // ===== STEP 3: Kick non-whitelisted members =====
