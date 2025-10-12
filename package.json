@@ -1,0 +1,26 @@
+{
+  "name": "ukeau-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that rewards vouch points for posting pictures in #vouch channel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": ["discord", "bot", "vouch", "points"],
+  "author": "WebsiteBuuilder",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "sqlite3": "^5.1.6",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}
+
+
