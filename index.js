@@ -47,6 +47,21 @@ db.serialize(() => {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )`);
+    db.run(`CREATE TABLE IF NOT EXISTS pending_vouches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT,
+        channel_id TEXT,
+        message_id TEXT,
+        voucher_id TEXT,
+        voucher_tag TEXT,
+        message_content TEXT,
+        attachment_urls TEXT,
+        provider_id TEXT,
+        provider_tag TEXT,
+        approved INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        approved_at DATETIME
+    )`);
 });
 
 function ensureVouchUsernameColumn() {
@@ -156,6 +171,134 @@ function isImageAttachment(attachment) {
 
 const providerRoleCache = new Map();
 
+function getSafeUserTag(user) {
+    if (!user) return 'Unknown user';
+    if (user.tag) return user.tag;
+    if (user.username && user.discriminator && user.discriminator !== '0') {
+        return `${user.username}#${user.discriminator}`;
+    }
+    return user.username || 'Unknown user';
+}
+
+function serializeAttachments(attachments) {
+    try {
+        return JSON.stringify(
+            attachments.map((att) => ({
+                url: att.url,
+                name: att.name || 'attachment'
+            }))
+        );
+    } catch (error) {
+        console.error('Failed to serialize attachments for pending vouch:', error);
+        return '[]';
+    }
+}
+
+function deserializeAttachments(raw) {
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed;
+        return [];
+    } catch (error) {
+        return [];
+    }
+}
+
+function truncateContent(text, limit = 200) {
+    if (!text) return '*No message content provided.*';
+    const cleaned = text.trim();
+    if (!cleaned) return '*No message content provided.*';
+    if (cleaned.length <= limit) return cleaned;
+    return `${cleaned.slice(0, limit - 3)}...`;
+}
+
+function createPendingVouch(entry) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `INSERT INTO pending_vouches (
+                guild_id, channel_id, message_id, voucher_id, voucher_tag,
+                message_content, attachment_urls
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                entry.guildId,
+                entry.channelId,
+                entry.messageId,
+                entry.voucherId,
+                entry.voucherTag,
+                entry.messageContent,
+                serializeAttachments(entry.attachments)
+            ],
+            function (err) {
+                if (err) { reject(err); return; }
+                resolve(this.lastID);
+            }
+        );
+    });
+}
+
+function listPendingVouches(limit = 5) {
+    const safeLimit = Math.max(1, Math.min(25, Number(limit) || 5));
+    return new Promise((resolve, reject) => {
+        db.all(
+            `SELECT id, guild_id, channel_id, message_id, voucher_id, voucher_tag,
+                    message_content, attachment_urls, created_at
+             FROM pending_vouches
+             WHERE approved = 0
+             ORDER BY datetime(created_at) ASC
+             LIMIT ?`,
+            [safeLimit],
+            (err, rows) => {
+                if (err) { reject(err); return; }
+                resolve(
+                    rows.map((row) => ({
+                        ...row,
+                        attachments: deserializeAttachments(row.attachment_urls)
+                    }))
+                );
+            }
+        );
+    });
+}
+
+function getPendingVouchById(id) {
+    return new Promise((resolve, reject) => {
+        db.get(
+            `SELECT id, guild_id, channel_id, message_id, voucher_id, voucher_tag,
+                    message_content, attachment_urls, approved
+             FROM pending_vouches
+             WHERE id = ?`,
+            [id],
+            (err, row) => {
+                if (err) { reject(err); return; }
+                if (!row) { resolve(null); return; }
+                resolve({
+                    ...row,
+                    attachments: deserializeAttachments(row.attachment_urls)
+                });
+            }
+        );
+    });
+}
+
+function markPendingVouchApproved(id, providerId, providerTag) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `UPDATE pending_vouches
+             SET approved = 1,
+                 provider_id = ?,
+                 provider_tag = ?,
+                 approved_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND approved = 0`,
+            [providerId, providerTag, id],
+            function (err) {
+                if (err) { reject(err); return; }
+                resolve(this.changes > 0);
+            }
+        );
+    });
+}
+
 async function resolveProviderRole(guild) {
     if (!guild) return null;
     const cached = providerRoleCache.get(guild.id);
@@ -206,14 +349,46 @@ async function handleVouchMessage(message) {
     const providerRole = await resolveProviderRole(message.guild);
     if (!providerRole) return;
 
-    const mentionedMembers = message.mentions?.members;
-    if (!mentionedMembers || mentionedMembers.size === 0) return;
-
-    const providerMember = mentionedMembers.find((member) => member.roles.cache.has(providerRole.id));
-    if (!providerMember) return;
-
     const attachments = [...message.attachments.values()].filter((att) => isImageAttachment(att));
     if (attachments.length === 0) return;
+
+    const mentionedMembers = message.mentions?.members;
+    const providerMember = mentionedMembers?.find((member) => member.roles.cache.has(providerRole.id)) || null;
+
+    if (!providerMember) {
+        try {
+            const pendingId = await createPendingVouch({
+                guildId: message.guild.id,
+                channelId: message.channel.id,
+                messageId: message.id,
+                voucherId: message.author.id,
+                voucherTag: getSafeUserTag(message.author),
+                messageContent: message.content || '',
+                attachments
+            });
+
+            const embed = new EmbedBuilder()
+                .setColor(0xf1c40f)
+                .setTitle('Vouch pending approval')
+                .setDescription('No provider was mentioned in this vouch. The provider can approve it using `/approvevouch`.')
+                .addFields(
+                    { name: 'Voucher', value: `${message.author}`, inline: true },
+                    { name: 'Pending ID', value: `#${pendingId}`, inline: true }
+                )
+                .setFooter({ text: 'Use /approvevouch id:<pending id> to claim this vouch.' })
+                .setTimestamp();
+
+            const firstAttachment = attachments[0];
+            if (firstAttachment?.url) {
+                embed.setImage(firstAttachment.url);
+            }
+
+            await message.reply({ embeds: [embed] }).catch(() => {});
+        } catch (error) {
+            console.error('Failed to create pending vouch entry:', error);
+        }
+        return;
+    }
 
     try {
         const multiplier = await getMultiplier();
@@ -261,6 +436,20 @@ const slashCommands = [
                 description: 'User to check',
                 type: 6,
                 required: false
+            }
+        ]
+    },
+    {
+        name: 'approvevouch',
+        description: 'Claim a pending vouch when you were not mentioned.',
+        dm_permission: false,
+        options: [
+            {
+                name: 'id',
+                description: 'Pending vouch ID to approve',
+                type: 4,
+                required: false,
+                min_value: 1
             }
         ]
     },
@@ -378,6 +567,115 @@ client.on('interactionCreate', async (interaction) => {
                     content: `${user} has ${formatPoints(points)}.`,
                     ephemeral: false
                 });
+                break;
+            }
+            case 'approvevouch': {
+                const pendingId = interaction.options.getInteger('id');
+
+                if (!pendingId) {
+                    const pending = await listPendingVouches(5);
+                    if (pending.length === 0) {
+                        await interaction.reply({
+                            content: 'There are no pending vouches awaiting approval right now.',
+                            ephemeral: true
+                        });
+                        break;
+                    }
+
+                    const embed = new EmbedBuilder()
+                        .setColor(0xf1c40f)
+                        .setTitle('Pending vouches needing approval')
+                        .setDescription('Use `/approvevouch id:<pending id>` to claim a vouch that belongs to you.')
+                        .setTimestamp();
+
+                    for (const entry of pending) {
+                        const voucherLabel = entry.voucher_id ? `<@${entry.voucher_id}>` : (entry.voucher_tag || 'Unknown user');
+                        const attachmentDisplay = entry.attachments.length
+                            ? entry.attachments
+                                  .slice(0, 3)
+                                  .map((att) => `[${att.name}](${att.url})`)
+                                  .join(' • ')
+                            : '_No attachments stored._';
+                        const messageLink = `https://discord.com/channels/${entry.guild_id}/${entry.channel_id}/${entry.message_id}`;
+
+                        embed.addFields({
+                            name: `ID #${entry.id}`,
+                            value: [
+                                `Voucher: ${voucherLabel}`,
+                                `Content: ${truncateContent(entry.message_content, 180)}`,
+                                `Attachments: ${attachmentDisplay}`,
+                                `[Open message](${messageLink})`
+                            ].join('\n')
+                        });
+                    }
+
+                    const firstWithImage = pending.find((entry) => entry.attachments[0]?.url);
+                    if (firstWithImage?.attachments[0]?.url) {
+                        embed.setImage(firstWithImage.attachments[0].url);
+                    }
+
+                    await interaction.reply({ embeds: [embed], ephemeral: true });
+                    break;
+                }
+
+                const pending = await getPendingVouchById(pendingId);
+                if (!pending) {
+                    await interaction.reply({ content: 'No pending vouch was found with that ID.', ephemeral: true });
+                    break;
+                }
+                if (pending.approved) {
+                    await interaction.reply({ content: 'That vouch has already been approved.', ephemeral: true });
+                    break;
+                }
+
+                const approved = await markPendingVouchApproved(
+                    pendingId,
+                    interaction.user.id,
+                    getSafeUserTag(interaction.user)
+                );
+
+                if (!approved) {
+                    await interaction.reply({ content: 'That vouch has already been approved.', ephemeral: true });
+                    break;
+                }
+
+                const multiplier = await getMultiplier();
+                const member = interaction.member || (interaction.guild ? await interaction.guild.members.fetch(interaction.user.id).catch(() => null) : null);
+                const displayName = member?.displayName || interaction.user.username;
+                const total = await changeUserBalance(interaction.user.id, displayName, multiplier);
+
+                const voucherMention = pending.voucher_id ? `<@${pending.voucher_id}>` : (pending.voucher_tag || 'Unknown user');
+                const messageLink = `https://discord.com/channels/${pending.guild_id}/${pending.channel_id}/${pending.message_id}`;
+
+                const embed = new EmbedBuilder()
+                    .setColor(0x2ecc71)
+                    .setTitle('Pending vouch approved!')
+                    .setDescription(`You were awarded ${formatPoints(multiplier)}.`)
+                    .addFields(
+                        { name: 'Voucher', value: voucherMention, inline: true },
+                        { name: 'New total', value: `${total} vouch points`, inline: true },
+                        { name: 'Original message', value: `[View message](${messageLink})` }
+                    )
+                    .setTimestamp();
+
+                if (pending.attachments[0]?.url) {
+                    embed.setImage(pending.attachments[0].url);
+                }
+
+                await interaction.reply({ embeds: [embed], ephemeral: true });
+
+                const dmEmbed = new EmbedBuilder()
+                    .setColor(0x2ecc71)
+                    .setTitle('You approved a vouch!')
+                    .setDescription(`You claimed a pending vouch from ${voucherMention} in **${interaction.guild?.name || 'this server'}**.`)
+                    .addFields(
+                        { name: 'Awarded', value: `${formatPoints(multiplier)} (x${multiplier})`, inline: true },
+                        { name: 'New total', value: `${total} vouch points`, inline: true }
+                    )
+                    .setTimestamp();
+
+                await interaction.user.send({ embeds: [dmEmbed] }).catch(() => {});
+
                 break;
             }
             case 'addpoints': {
